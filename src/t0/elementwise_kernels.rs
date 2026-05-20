@@ -91,6 +91,107 @@ pub fn elementwise_grid(n: u32) -> u32 {
     ((n + WG_SIZE - 1) / WG_SIZE) * WG_SIZE
 }
 
+/// Build memcpy kernel with f32x4 vectorized loads/stores (16 bytes per thread).
+/// Each thread copies 4 consecutive f32 values.
+///
+/// Kernarg layout: [input:u64, output:u64, n_4elems:u32]
+/// where n_4elems = ceil(n_elems / 4). Grid: ceil(n_4elems/WG_SIZE) * WG_SIZE.
+pub fn build_memcpy_x4() -> BlockKernel {
+    let mut kb = BlockKernel::new("memcpy_x4", WG_SIZE);
+
+    let input_ptr = kb.arg_ptr("input");
+    let output_ptr = kb.arg_ptr("output");
+    let n_4elems = kb.arg_u32("n_4elems");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+    let wg_size = kb.const_u32(WG_SIZE);
+    let four = kb.const_u32(4);
+    let one = kb.const_u32(1);
+    let two = kb.const_u32(2);
+    let three = kb.const_u32(3);
+
+    let wg_offset = pid.mul(&mut kb, wg_size);
+    let gid = wg_offset.add(&mut kb, tid);
+    let mask = gid.lt(&mut kb, n_4elems);
+    let base_offset = gid.mul(&mut kb, four);
+    let off1 = base_offset.add(&mut kb, one);
+    let off2 = base_offset.add(&mut kb, two);
+    let off3 = base_offset.add(&mut kb, three);
+
+    let v0 = kb.load(input_ptr, base_offset, mask);
+    let v1 = kb.load(input_ptr, off1, mask);
+    let v2 = kb.load(input_ptr, off2, mask);
+    let v3 = kb.load(input_ptr, off3, mask);
+
+    kb.store(output_ptr, base_offset, v0, mask);
+    kb.store(output_ptr, off1, v1, mask);
+    kb.store(output_ptr, off2, v2, mask);
+    kb.store(output_ptr, off3, v3, mask);
+
+    kb
+}
+
+/// Build fused K+V memcpy kernel — copies K and V in a single dispatch.
+/// Each thread copies 4 f32 elements from both K and V (32 bytes total per thread).
+///
+/// Kernarg layout: [k_src:u64, v_src:u64, k_dst:u64, v_dst:u64, n_4elems:u32]
+/// where n_4elems = ceil(head_elements / 4) for single-token,
+/// or n_4elems = ceil(seq_len * head_elements / 4) for multi-token.
+pub fn build_memcpy_kv_x4() -> BlockKernel {
+    let mut kb = BlockKernel::new("memcpy_kv_x4", WG_SIZE);
+
+    let k_src = kb.arg_ptr("k_src");
+    let v_src = kb.arg_ptr("v_src");
+    let k_dst = kb.arg_ptr("k_dst");
+    let v_dst = kb.arg_ptr("v_dst");
+    let n_4elems = kb.arg_u32("n_4elems");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+    let wg_size = kb.const_u32(WG_SIZE);
+    let four = kb.const_u32(4);
+    let one = kb.const_u32(1);
+    let two = kb.const_u32(2);
+    let three = kb.const_u32(3);
+
+    let wg_offset = pid.mul(&mut kb, wg_size);
+    let gid = wg_offset.add(&mut kb, tid);
+    let mask = gid.lt(&mut kb, n_4elems);
+    let base = gid.mul(&mut kb, four);
+    let off1 = base.add(&mut kb, one);
+    let off2 = base.add(&mut kb, two);
+    let off3 = base.add(&mut kb, three);
+
+    let k0 = kb.load(k_src, base, mask);
+    let k1 = kb.load(k_src, off1, mask);
+    let k2 = kb.load(k_src, off2, mask);
+    let k3 = kb.load(k_src, off3, mask);
+
+    let v0 = kb.load(v_src, base, mask);
+    let v1 = kb.load(v_src, off1, mask);
+    let v2 = kb.load(v_src, off2, mask);
+    let v3 = kb.load(v_src, off3, mask);
+
+    kb.store(k_dst, base, k0, mask);
+    kb.store(k_dst, off1, k1, mask);
+    kb.store(k_dst, off2, k2, mask);
+    kb.store(k_dst, off3, k3, mask);
+
+    kb.store(v_dst, base, v0, mask);
+    kb.store(v_dst, off1, v1, mask);
+    kb.store(v_dst, off2, v2, mask);
+    kb.store(v_dst, off3, v3, mask);
+
+    kb
+}
+
+/// Compute grid for vectorized (x4) elementwise kernels.
+pub fn elementwise_grid_x4(n_elems: u32) -> u32 {
+    let n_4elems = (n_elems + 3) / 4; // ceil(n_elems / 4)
+    ((n_4elems + WG_SIZE - 1) / WG_SIZE) * WG_SIZE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

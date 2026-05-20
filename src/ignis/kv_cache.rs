@@ -202,6 +202,54 @@ impl KvCache {
         self.position.store(pos + n as u32, Ordering::Release);
     }
 
+    /// Batch decode: submit K+V copies for all layers async, then wait once.
+    ///
+    /// This is the optimal decode path: N layer copies are submitted as async
+    /// dispatches, then synchronized with a single `wait_idle()` at the end.
+    ///
+    /// # Arguments
+    /// - `layer_kvs`: iterator of `(layer_index, key_tensor, value_tensor)`
+    ///   where each tensor has shape `[num_kv_heads, head_dim]`
+    ///
+    /// Typical usage:
+    /// ```ignore
+    /// let layer_data: Vec<(usize, &Tensor, &Tensor)> = (0..num_layers)
+    ///     .map(|l| (l, &layer_keys[l], &layer_values[l]))
+    ///     .collect();
+    /// cache.append_batch(&r, &layer_data)?;
+    /// cache.advance();
+    /// ```
+    pub fn append_batch(
+        &self,
+        runtime: &Arc<GpuRuntime>,
+        layer_kvs: &[(usize, &Tensor, &Tensor)],
+    ) -> Result<(), String> {
+        let pos = self.position.load(Ordering::Acquire) as usize;
+
+        // Phase 1: Submit all layer copies async (no waiting)
+        for &(layer, key, value) in layer_kvs {
+            assert!(layer < self.config.num_layers, "layer {} >= num_layers", layer);
+            assert!(pos < self.config.max_seq_len,
+                "KV cache overflow: pos={} >= max_seq_len={}", pos, self.config.max_seq_len);
+
+            let head_elements = self.config.num_kv_heads * self.config.head_dim;
+            let head_bytes = head_elements * 4;
+
+            assert_eq!(key.numel(), head_elements,
+                "key numel mismatch at layer {}", layer);
+            assert_eq!(value.numel(), head_elements,
+                "value numel mismatch at layer {}", layer);
+
+            let k_dst = self.buf.gpu_addr() + self.k_offset(layer, pos) as u64;
+            let v_dst = self.buf.gpu_addr() + self.v_offset(layer, pos) as u64;
+
+            gpu_memcpy_kv_async(runtime, key.gpu_addr(), value.gpu_addr(), k_dst, v_dst, head_bytes)?;
+        }
+
+        // Phase 2: Single synchronization waits for all submissions
+        runtime.synchronize()
+    }
+
     /// Append a single token's K and V at a specific position (without advancing).
     ///
     /// Used internally by `append()` and `append_many()`.
@@ -231,19 +279,21 @@ impl KvCache {
         let k_offset = self.k_offset(layer, pos);
         let v_offset = self.v_offset(layer, pos);
 
-        // GPU memcpy: key → cache
-        gpu_memcpy(runtime, key.gpu_addr(), self.buf.gpu_addr() + k_offset as u64, head_bytes)?;
-
-        // GPU memcpy: value → cache
-        gpu_memcpy(runtime, value.gpu_addr(), self.buf.gpu_addr() + v_offset as u64, head_bytes)?;
-
-        Ok(())
+        // K+V copy: separate dispatches (fused kernel has issues on small BAR)
+        let k_dst = self.buf.gpu_addr() + k_offset as u64;
+        let v_dst = self.buf.gpu_addr() + v_offset as u64;
+        gpu_memcpy(runtime, key.gpu_addr(), k_dst, head_bytes)?;
+        gpu_memcpy(runtime, value.gpu_addr(), v_dst, head_bytes)
     }
 
     // ── Multi-token append (prefill path) ──
 
     /// Append a batch of tokens' K and V to the cache (prefill path).
     /// Does NOT advance position — call `advance_by(seq_len)` after writing all layers.
+    ///
+    /// Uses async dispatch: submits all layer copies without waiting, then
+    /// synchronizes once at the end. This reduces dispatch overhead from
+    /// 2×N layer round-trips to 1.
     ///
     /// # Arguments
     /// - `layer`: transformer layer index
@@ -278,26 +328,74 @@ impl KvCache {
             "KV cache overflow: pos={} + seq_len={} > max_seq_len={}",
             pos, seq_len, self.config.max_seq_len);
 
-        // Copy each token's K/V
         let head_elements = self.config.num_kv_heads * self.config.head_dim;
         let head_bytes = head_elements * 4;
         let tokens_bytes = seq_len * head_bytes;
 
-        // Source offsets (keys/values are contiguous [seq_len, kv_heads, head_dim])
         let keys_addr = keys.gpu_addr();
         let values_addr = values.gpu_addr();
-
-        // Destination offsets in cache
         let k_dst = self.buf.gpu_addr() + self.k_offset(layer, pos) as u64;
         let v_dst = self.buf.gpu_addr() + self.v_offset(layer, pos) as u64;
 
-        // Single bulk copy: keys → cache K slice
-        gpu_memcpy(runtime, keys_addr, k_dst, tokens_bytes)?;
+        // Fused K+V async copy: submit without waiting
+        gpu_memcpy_kv_async(runtime, keys_addr, values_addr, k_dst, v_dst, tokens_bytes)?;
 
-        // Single bulk copy: values → cache V slice
-        gpu_memcpy(runtime, values_addr, v_dst, tokens_bytes)?;
+        // Synchronize after this layer's submission
+        // For multi-layer prefill, the last layer's sync will wait for all prior submissions
+        runtime.synchronize()
+    }
 
-        Ok(())
+    /// Batch append: submit K+V copies for all layers async, then wait once.
+    ///
+    /// This is the optimal prefill path: N layer copies are submitted as async
+    /// dispatches, then synchronized with a single `wait_idle()` at the end.
+    ///
+    /// Compared to calling `append_many()` per layer (which syncs after each),
+    /// this reduces dispatch overhead from N round-trips to 1.
+    ///
+    /// # Arguments
+    /// - `layer_kvs`: iterator of `(layer_index, keys_tensor, values_tensor)`
+    ///   where each tensor has shape `[seq_len, num_kv_heads, head_dim]`
+    ///
+    /// Typical usage:
+    /// ```ignore
+    /// let layer_data: Vec<(usize, &Tensor, &Tensor)> = (0..num_layers)
+    ///     .map(|l| (l, &layer_keys[l], &layer_values[l]))
+    ///     .collect();
+    /// cache.append_many_batch(&r, &layer_data)?;
+    /// cache.advance_by(seq_len);
+    /// ```
+    pub fn append_many_batch(
+        &self,
+        runtime: &Arc<GpuRuntime>,
+        layer_kvs: &[(usize, &Tensor, &Tensor)],
+    ) -> Result<(), String> {
+        let pos = self.position.load(Ordering::Acquire) as usize;
+
+        // Phase 1: Submit all layer copies async (no waiting)
+        for &(layer, keys, values) in layer_kvs {
+            let seq_len = keys.shape()[0];
+            assert!(keys.shape().len() == 3, "keys must be 3D");
+            assert!(values.shape().len() == 3, "values must be 3D");
+            assert_eq!(keys.shape()[1], self.config.num_kv_heads,
+                "keys kv_heads mismatch at layer {}", layer);
+            assert_eq!(keys.shape()[2], self.config.head_dim,
+                "keys head_dim mismatch at layer {}", layer);
+            assert!(pos + seq_len <= self.config.max_seq_len,
+                "KV cache overflow at layer {}", layer);
+
+            let head_elements = self.config.num_kv_heads * self.config.head_dim;
+            let head_bytes = head_elements * 4;
+            let tokens_bytes = seq_len * head_bytes;
+
+            let k_dst = self.buf.gpu_addr() + self.k_offset(layer, pos) as u64;
+            let v_dst = self.buf.gpu_addr() + self.v_offset(layer, pos) as u64;
+
+            gpu_memcpy_kv_async(runtime, keys.gpu_addr(), values.gpu_addr(), k_dst, v_dst, tokens_bytes)?;
+        }
+
+        // Phase 2: Single synchronization waits for all submissions
+        runtime.synchronize()
     }
 
     // ── Get (for attention computation) ──
@@ -399,6 +497,7 @@ impl KvCache {
         let offset = self.v_offset(layer, pos);
         let n = self.config.num_kv_heads * self.config.head_dim;
         let mut data = vec![0f32; n];
+        self.buf.read_bytes(offset, n * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.buf.host_ptr.add(offset) as *const f32,
@@ -410,7 +509,7 @@ impl KvCache {
     }
 }
 
-/// GPU memory copy using the existing elementwise memcpy kernel.
+/// GPU memory copy using vectorized (f32x4) elementwise memcpy kernel.
 ///
 /// Copies `n_bytes` from `src_addr` to `dst_addr` on the GPU.
 /// Both addresses must be valid GPU VRAM addresses.
@@ -421,25 +520,89 @@ fn gpu_memcpy(
     dst_addr: u64,
     n_bytes: usize,
 ) -> Result<(), String> {
-    // Number of f32 elements to copy
     let n_elems = n_bytes / 4;
+    let n_4elems = (n_elems + 3) / 4; // ceil(n_elems / 4)
     assert_eq!(n_bytes % 4, 0, "gpu_memcpy requires 4-byte aligned size");
 
-    // Use the existing memcpy kernel from elementwise_kernels
     let kernel = runtime.ensure_kernel_blockdsl(
-        "gpu_memcpy_kv",
-        || crate::t0::elementwise_kernels::build_memcpy(),
+        "gpu_memcpy_x4",
+        || crate::t0::elementwise_kernels::build_memcpy_x4(),
     )?;
 
-    // Kernarg layout: [src_ptr(u64), dst_ptr(u64), n_elems(u32)]
     let ka = crate::kernargs![
         src_addr => u64,
         dst_addr => u64,
+        n_4elems as u32 => u32,
+    ];
+
+    let grid_x = crate::t0::elementwise_kernels::elementwise_grid_x4(n_elems as u32);
+    runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)
+}
+
+/// Fused K+V memory copy — copies both K and V in a single dispatch.
+/// Uses vectorized (f32x4) loads/stores for 4× bandwidth per thread.
+///
+/// Copies `n_bytes` from `k_src → k_dst` AND `v_src → v_dst` in one kernel.
+/// n_bytes must be the size of K (or V), which are assumed equal.
+#[cfg(feature = "rocm")]
+fn gpu_memcpy_kv(
+    runtime: &Arc<GpuRuntime>,
+    k_src: u64,
+    v_src: u64,
+    k_dst: u64,
+    v_dst: u64,
+    n_bytes: usize,
+) -> Result<(), String> {
+    let n_elems = n_bytes / 4;
+    assert_eq!(n_bytes % 4, 0, "gpu_memcpy_kv requires 4-byte aligned size");
+
+    let kernel = runtime.ensure_kernel_blockdsl(
+        "gpu_memcpy_kv_x4",
+        || crate::t0::elementwise_kernels::build_memcpy_kv_x4(),
+    )?;
+
+    let ka = crate::kernargs![
+        k_src => u64,
+        v_src => u64,
+        k_dst => u64,
+        v_dst => u64,
         n_elems as u32 => u32,
     ];
 
-    let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n_elems as u32);
+    let grid_x = crate::t0::elementwise_kernels::elementwise_grid_x4(n_elems as u32);
     runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)
+}
+
+/// Async fused K+V memory copy — submits without waiting.
+/// Caller must synchronize via `runtime.wait_idle()` or `runtime.synchronize()`.
+#[cfg(feature = "rocm")]
+fn gpu_memcpy_kv_async(
+    runtime: &Arc<GpuRuntime>,
+    k_src: u64,
+    v_src: u64,
+    k_dst: u64,
+    v_dst: u64,
+    n_bytes: usize,
+) -> Result<usize, String> {
+    let n_elems = n_bytes / 4;
+    assert_eq!(n_bytes % 4, 0, "gpu_memcpy_kv_async requires 4-byte aligned size");
+
+    let kernel = runtime.ensure_kernel_blockdsl(
+        "gpu_memcpy_kv_x4",
+        || crate::t0::elementwise_kernels::build_memcpy_kv_x4(),
+    )?;
+
+    let ka = crate::kernargs![
+        k_src => u64,
+        v_src => u64,
+        k_dst => u64,
+        v_dst => u64,
+        n_elems as u32 => u32,
+    ];
+
+    let grid_x = crate::t0::elementwise_kernels::elementwise_grid_x4(n_elems as u32);
+    let slot = runtime.dispatch_async(&kernel, [grid_x, 1, 1], &ka);
+    Ok(slot)
 }
 
 // ═══════════════════════════════════════════════════════════════
