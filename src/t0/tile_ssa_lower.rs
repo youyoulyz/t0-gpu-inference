@@ -1325,6 +1325,14 @@ fn copy_machine_val(
         (MachineVal::InlineInt(v), MachineVal::SReg(d)) => {
             k.push(Op::SMov { dst: *d, src: SOperand::InlineInt(*v) });
         }
+        (MachineVal::InlineFloat(v), MachineVal::SReg(d)) => {
+            // Float immediate → SReg: store bit pattern as i32
+            k.push(Op::SMov { dst: *d, src: SOperand::InlineInt((*v).to_bits() as i32) });
+        }
+        (MachineVal::InlineFloat(v), MachineVal::VReg(d)) => {
+            // Float immediate → VReg: use v_mov_b32 with literal
+            k.v_mov_imm(*d, (*v).to_bits() as i32);
+        }
         (MachineVal::VReg(s), MachineVal::VReg(d)) => {
             if s.0 != d.0 {
                 k.push(Op::VMov { dst: *d, src: Operand::VReg(*s) });

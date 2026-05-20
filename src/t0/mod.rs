@@ -50,6 +50,7 @@ pub mod embedding_kernels;
 pub mod adamw_kernels;
 pub mod elementwise_kernels;
 pub mod argmax_kernels;
+pub mod softmax_large;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]
