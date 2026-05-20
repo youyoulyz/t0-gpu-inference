@@ -25,6 +25,7 @@ pub mod lr_scheduler;
 pub mod grad_clip;
 pub mod loss_scaler;
 pub mod kv_cache;
+pub mod safetensors;
 
 // Tests
 #[cfg(test)]
