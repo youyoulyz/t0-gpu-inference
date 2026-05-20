@@ -259,6 +259,113 @@ mod kv_cache_integration {
         }
     }
 
+    /// Benchmark decode latency: single-token KV append using sync dispatch (old path).
+    /// This measures the baseline: N layers × 2 sync dispatches (K+V) per token.
+    #[test]
+    fn test_kv_cache_decode_latency_sync() {
+        let r = rt();
+
+        let configs = vec![
+            ("Tiny",  KvCacheConfig { num_layers: 4,   num_kv_heads: 4,   head_dim: 64,  max_seq_len: 1024 }),
+            ("Small", KvCacheConfig { num_layers: 8,   num_kv_heads: 8,   head_dim: 128, max_seq_len: 2048 }),
+            ("Medium", KvCacheConfig { num_layers: 16,  num_kv_heads: 8,   head_dim: 128, max_seq_len: 4096 }),
+            ("Qwen3-8B-like", KvCacheConfig { num_layers: 36, num_kv_heads: 8, head_dim: 128, max_seq_len: 8192 }),
+        ];
+
+        for (name, cfg) in &configs {
+            let cache = KvCache::new(&r, cfg.clone()).unwrap();
+            let head_elements = cfg.num_kv_heads * cfg.head_dim;
+
+            // Pre-allocate tensors to eliminate alloc overhead
+            let k_data = vec![0.5f32; head_elements];
+            let v_data = vec![0.5f32; head_elements];
+            let key = Tensor::from_f32(&r, &k_data, &[cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+            let val = Tensor::from_f32(&r, &v_data, &[cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+
+            // Warmup
+            for _ in 0..3 {
+                for layer in 0..cfg.num_layers {
+                    let _ = cache.append(&r, layer, &key, &val);
+                }
+                cache.advance();
+            }
+            cache.reset();
+
+            // Timed: measure per-token decode latency (sync dispatch per layer)
+            let n_iters = 100;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                for layer in 0..cfg.num_layers {
+                    let _ = cache.append(&r, layer, &key, &val);
+                }
+                cache.advance();
+                cache.reset();
+            }
+            let elapsed_us = t0.elapsed().as_secs_f64() * 1e6;
+            let per_token_us = elapsed_us / n_iters as f64;
+            let per_layer_us = per_token_us / cfg.num_layers as f64;
+
+            let tokens_per_sec = if per_token_us > 0.0 { 1e6 / per_token_us } else { 0.0 };
+
+            eprintln!("  [SYNC] {:<14} {} layers  {:.1} μs/token  ({:.2} μs/layer)  {:.0} tok/s",
+                name, cfg.num_layers, per_token_us, per_layer_us, tokens_per_sec);
+        }
+    }
+
+    /// Benchmark decode latency: async batch path (append_batch).
+    /// Submits all layer copies async, then syncs once.
+    /// This is the optimal decode path: N async dispatches → 1 sync.
+    #[test]
+    fn test_kv_cache_decode_latency_async() {
+        let r = rt();
+
+        let configs = vec![
+            ("Tiny",  KvCacheConfig { num_layers: 4,   num_kv_heads: 4,   head_dim: 64,  max_seq_len: 1024 }),
+            ("Small", KvCacheConfig { num_layers: 8,   num_kv_heads: 8,   head_dim: 128, max_seq_len: 2048 }),
+            ("Medium", KvCacheConfig { num_layers: 16,  num_kv_heads: 8,   head_dim: 128, max_seq_len: 4096 }),
+            ("Qwen3-8B-like", KvCacheConfig { num_layers: 36, num_kv_heads: 8, head_dim: 128, max_seq_len: 8192 }),
+        ];
+
+        for (name, cfg) in &configs {
+            let cache = KvCache::new(&r, cfg.clone()).unwrap();
+            let head_elements = cfg.num_kv_heads * cfg.head_dim;
+
+            // Pre-allocate tensors
+            let k_data = vec![0.5f32; head_elements];
+            let v_data = vec![0.5f32; head_elements];
+            let key = Tensor::from_f32(&r, &k_data, &[cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+            let val = Tensor::from_f32(&r, &v_data, &[cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+
+            // Build layer_kvs array once
+            let layer_kvs: Vec<(usize, &Tensor, &Tensor)> =
+                (0..cfg.num_layers).map(|l| (l, &key, &val)).collect();
+
+            // Warmup
+            for _ in 0..3 {
+                let _ = cache.append_batch(&r, &layer_kvs);
+                cache.advance();
+            }
+            cache.reset();
+
+            // Timed: async batch decode
+            let n_iters = 100;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let _ = cache.append_batch(&r, &layer_kvs);
+                cache.advance();
+                cache.reset();
+            }
+            let elapsed_us = t0.elapsed().as_secs_f64() * 1e6;
+            let per_token_us = elapsed_us / n_iters as f64;
+            let per_layer_us = per_token_us / cfg.num_layers as f64;
+
+            let tokens_per_sec = if per_token_us > 0.0 { 1e6 / per_token_us } else { 0.0 };
+
+            eprintln!("  [ASYNC] {:<13} {} layers  {:.1} μs/token  ({:.2} μs/layer)  {:.0} tok/s",
+                name, cfg.num_layers, per_token_us, per_layer_us, tokens_per_sec);
+        }
+    }
+
     /// Benchmark decode latency: single-token KV append per layer.
     #[test]
     fn test_kv_cache_decode_latency() {
@@ -310,6 +417,99 @@ mod kv_cache_integration {
             eprintln!("  {:<14} {} layers  {:.1} μs/token  ({:.2} μs/layer)  {:.0} tok/s",
                 name, cfg.num_layers, per_token_us, per_layer_us, tokens_per_sec);
         }
+    }
+
+    /// Benchmark reset + prefill cycle (simulates multi-turn conversation) — sync path.
+    #[test]
+    fn test_kv_cache_multi_turn_sync() {
+        let r = rt();
+        let cfg = KvCacheConfig {
+            num_layers: 8,
+            num_kv_heads: 8,
+            head_dim: 128,
+            max_seq_len: 4096,
+        };
+        let cache = KvCache::new(&r, cfg.clone()).unwrap();
+        let head_elements = cfg.num_kv_heads * cfg.head_dim;
+
+        let seq_len = 256;
+        let data = vec![0.5f32; seq_len * head_elements];
+        let keys = Tensor::from_f32(&r, &data, &[seq_len, cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+        let vals = Tensor::from_f32(&r, &data, &[seq_len, cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+
+        // Warmup
+        for _ in 0..3 {
+            for layer in 0..cfg.num_layers {
+                let _ = cache.append_many(&r, layer, &keys, &vals);
+            }
+            cache.advance_by(seq_len);
+            cache.reset();
+        }
+
+        // Timed: simulate 20 conversation turns
+        let n_turns = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_turns {
+            for layer in 0..cfg.num_layers {
+                let _ = cache.append_many(&r, layer, &keys, &vals);
+            }
+            cache.advance_by(seq_len);
+            cache.reset();
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let per_turn_ms = elapsed_ms / n_turns as f64;
+
+        let total_bytes = cfg.num_layers * 2 * seq_len * head_elements * 4;
+        let bandwidth_gbs = (total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (per_turn_ms / 1000.0);
+        eprintln!("  [SYNC] Multi-turn: {} turns, {} tokens each, {} layers", n_turns, seq_len, cfg.num_layers);
+        eprintln!("  Per turn: {:.2} ms ({:.1} GB/s)", per_turn_ms, bandwidth_gbs);
+    }
+
+    /// Benchmark reset + prefill cycle — async batch path (append_many_batch).
+    /// Submits all layer copies async, then syncs once.
+    #[test]
+    fn test_kv_cache_multi_turn_async() {
+        let r = rt();
+        let cfg = KvCacheConfig {
+            num_layers: 8,
+            num_kv_heads: 8,
+            head_dim: 128,
+            max_seq_len: 4096,
+        };
+        let cache = KvCache::new(&r, cfg.clone()).unwrap();
+        let head_elements = cfg.num_kv_heads * cfg.head_dim;
+
+        let seq_len = 256;
+        let data = vec![0.5f32; seq_len * head_elements];
+        let keys = Tensor::from_f32(&r, &data, &[seq_len, cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+        let vals = Tensor::from_f32(&r, &data, &[seq_len, cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+
+        // Build layer_kvs array once
+        let layer_kvs: Vec<(usize, &Tensor, &Tensor)> =
+            (0..cfg.num_layers).map(|l| (l, &keys, &vals)).collect();
+
+        // Warmup
+        for _ in 0..3 {
+            let _ = cache.append_many_batch(&r, &layer_kvs);
+            cache.advance_by(seq_len);
+            cache.reset();
+        }
+
+        // Timed: simulate 20 conversation turns
+        let n_turns = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_turns {
+            let _ = cache.append_many_batch(&r, &layer_kvs);
+            cache.advance_by(seq_len);
+            cache.reset();
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let per_turn_ms = elapsed_ms / n_turns as f64;
+
+        let total_bytes = cfg.num_layers * 2 * seq_len * head_elements * 4;
+        let bandwidth_gbs = (total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (per_turn_ms / 1000.0);
+        eprintln!("  [ASYNC] Multi-turn: {} turns, {} tokens each, {} layers", n_turns, seq_len, cfg.num_layers);
+        eprintln!("  Per turn: {:.2} ms ({:.1} GB/s)", per_turn_ms, bandwidth_gbs);
     }
 
     /// Benchmark reset + prefill cycle (simulates multi-turn conversation).
