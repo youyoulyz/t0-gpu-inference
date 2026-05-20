@@ -681,6 +681,20 @@ impl AsmEmitter {
                         self.indent, vv, vv, vt).unwrap();
                 }
             }
+            Op::WaveReduceMinF32 { val, tmp } => {
+                let vv = a.phys_v(*val);
+                let vt = a.phys_v(*tmp);
+                for (offset, label) in &[
+                    (0x401Fu16, "xor16"), (0x201F, "xor8"),
+                    (0x101F, "xor4"), (0x081F, "xor2"), (0x041F, "xor1"),
+                ] {
+                    writeln!(self.buf, "{}ds_swizzle_b32 v{}, v{} offset:{:#06x}  ; {}",
+                        self.indent, vt, vv, offset, label).unwrap();
+                    writeln!(self.buf, "{}s_waitcnt lgkmcnt(0)", self.indent).unwrap();
+                    writeln!(self.buf, "{}v_min_f32 v{}, v{}, v{}",
+                        self.indent, vv, vv, vt).unwrap();
+                }
+            }
 
             // ── Data type conversion ──
             Op::CvtPkBf16F32 { dst, src0, src1 } => {
@@ -801,6 +815,18 @@ impl AsmEmitter {
                 let s0 = operand_str(src0, a);
                 let s1 = operand_str(src1, a);
                 writeln!(self.buf, "{}v_cmp_ge_u32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
+            }
+            Op::VCmpEqF32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_eq_f32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
+            }
+            Op::VCmpGtF32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_gt_f32 vcc_lo, {}, {}",
                     self.indent, s0, s1).unwrap();
             }
             Op::VCmpGtF32Imm0 { src } => {

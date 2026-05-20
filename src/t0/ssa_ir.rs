@@ -1549,7 +1549,8 @@ fn rename_op_defs(op: &mut Op, map: &HashMap<VReg, VReg>) {
         }
         // Wave reductions (val is read/write, tmp is scratch)
         Op::WaveReduceAddF32 { val, tmp } |
-        Op::WaveReduceMaxF32 { val, tmp } => {
+        Op::WaveReduceMaxF32 { val, tmp } |
+        Op::WaveReduceMinF32 { val, tmp } => {
             if let Some(&new) = map.get(val) { *val = new; }
             if let Some(&new) = map.get(tmp) { *tmp = new; }
         }
@@ -1693,7 +1694,8 @@ fn rename_op_uses(op: &mut Op, old: VReg, new: VReg) {
         }
         // Wave reductions (val and tmp are both read/write)
         Op::WaveReduceAddF32 { val, tmp } |
-        Op::WaveReduceMaxF32 { val, tmp } => {
+        Op::WaveReduceMaxF32 { val, tmp } |
+        Op::WaveReduceMinF32 { val, tmp } => {
             if *val == old { *val = new; }
             if *tmp == old { *tmp = new; }
         }
@@ -1877,6 +1879,7 @@ pub fn licm_mach_func(func: &mut MachFunc) -> usize {
                         Op::GlobalAtomicAddF32 { .. } | Op::GlobalAtomicAddU32Rtn { .. } |
                         Op::Wmma { .. } |  // WMMA: 8-aligned VReg constraint
                         Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } |
+                        Op::WaveReduceMinF32 { .. } |
                         Op::DsSwizzle { .. } | Op::VPermlanex16B32 { .. } |
                         Op::VReadfirstlane { .. } |
                         Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |

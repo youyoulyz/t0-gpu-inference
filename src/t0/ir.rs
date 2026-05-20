@@ -381,6 +381,10 @@ pub enum Op {
 
     /// v_cmp_ge_u32 vcc, src0, src1 — set VCC where src0 >= src1 (unsigned)
     VCmpGeU32 { src0: Operand, src1: Operand },
+    /// v_cmp_eq_f32 vcc, src0, src1 — set VCC where src0 == src1
+    VCmpEqF32 { src0: Operand, src1: Operand },
+    /// v_cmp_gt_f32 vcc, src0, src1 — set VCC where src0 > src1
+    VCmpGtF32 { src0: Operand, src1: Operand },
 
     /// v_cmp_gt_f32 vcc, src, 0.0 — set VCC where src > 0.0 (for ReLU mask)
     VCmpGtF32Imm0 { src: VReg },
@@ -447,6 +451,8 @@ pub enum Op {
     // ── Wave reduction (max) ──
     /// Wave32 max reduction via ds_swizzle XOR patterns
     WaveReduceMaxF32 { val: VReg, tmp: VReg },
+    /// Wave32 min reduction via ds_swizzle XOR patterns
+    WaveReduceMinF32 { val: VReg, tmp: VReg },
 
     // ── Hardware performance counters ──
     /// Read HW_REG_SHADER_CYCLES into a VGPR (GFX1100 only).
@@ -627,7 +633,9 @@ impl Op {
 
             // Comparisons
             Op::VCmpLtU32 { src0, src1 } |
-            Op::VCmpGeU32 { src0, src1 } => {
+            Op::VCmpGeU32 { src0, src1 } |
+            Op::VCmpEqF32 { src0, src1 } |
+            Op::VCmpGtF32 { src0, src1 } => {
                 let mut v = vec![];
                 v.extend(operand_vregs(src0));
                 v.extend(operand_vregs(src1));
@@ -679,6 +687,7 @@ impl Op {
             // Wave reduce
             Op::WaveReduceAddF32 { val, tmp } => vec![*val, *tmp],
             Op::WaveReduceMaxF32 { val, tmp } => vec![*val, *tmp],
+            Op::WaveReduceMinF32 { val, tmp } => vec![*val, *tmp],
 
             // Raw asm (unknown, assume none)
             Op::RawAsm(_) => vec![],
@@ -726,7 +735,8 @@ impl Op {
             Op::Wmma { dst, .. } => (0..8).map(|i| VReg(dst.0 + i)).collect(),
 
             // Wave reductions modify val in-place
-            Op::WaveReduceAddF32 { val, .. } | Op::WaveReduceMaxF32 { val, .. } => vec![*val],
+            Op::WaveReduceAddF32 { val, .. } | Op::WaveReduceMaxF32 { val, .. } |
+            Op::WaveReduceMinF32 { val, .. } => vec![*val],
 
             // Everything else defines nothing (stores, branches, barriers, compares, etc.)
             _ => vec![],
@@ -863,7 +873,9 @@ impl Op {
 
             // ── Comparisons ──
             Op::VCmpLtU32 { src0, src1 } |
-            Op::VCmpGeU32 { src0, src1 } => {
+            Op::VCmpGeU32 { src0, src1 } |
+            Op::VCmpEqF32 { src0, src1 } |
+            Op::VCmpGtF32 { src0, src1 } => {
                 let mut v = vec![];
                 v.extend(operand_vregs(src0));
                 v.extend(operand_vregs(src1));
@@ -894,7 +906,8 @@ impl Op {
 
             // ── Wave reduce (val is both read and written — include as use) ──
             Op::WaveReduceAddF32 { val, tmp } |
-            Op::WaveReduceMaxF32 { val, tmp } => vec![*val, *tmp],
+            Op::WaveReduceMaxF32 { val, tmp } |
+            Op::WaveReduceMinF32 { val, tmp } => vec![*val, *tmp],
 
             // ── Performance counters ──
             Op::ReadShaderCycles { .. } => vec![],
@@ -994,6 +1007,7 @@ impl Op {
             Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
             // Cross-lane ops (read-modify-write / side channel)
             Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } |
+            Op::WaveReduceMinF32 { .. } |
             Op::DsSwizzle { .. } | Op::VPermlanex16B32 { .. } |
             // Control flow and sync
             Op::Label(_) | Op::BranchScc1(_) | Op::BranchScc0(_) |
@@ -1007,6 +1021,7 @@ impl Op {
             Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
             Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
             Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
+            Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } |
             // SCC-writing comparisons
             Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } |
             // Scalar ops (affect SCC, manage state)
@@ -1051,6 +1066,7 @@ impl Op {
             Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
             Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
             Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
+            Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } |
             // 64-bit carry-out → VCC
             Op::VAddCo { .. } | Op::VAddCOU32 { .. } |
             // ClearVcc / SMovToVcc explicitly write VCC

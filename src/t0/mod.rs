@@ -49,6 +49,7 @@ pub mod rmsnorm_kernels;
 pub mod embedding_kernels;
 pub mod adamw_kernels;
 pub mod elementwise_kernels;
+pub mod argmax_kernels;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]

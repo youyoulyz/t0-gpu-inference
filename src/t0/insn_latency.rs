@@ -181,7 +181,8 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
         Op::VCmpGtF32Imm0 { .. } |
         Op::VCmpGtU32Imm { .. } | Op::VCmpEqU32Imm { .. } |
-        Op::VCmpGeI32 { .. } => InsnLatency::valu(),
+        Op::VCmpGeI32 { .. } |
+        Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } => InsnLatency::valu(),
 
         // ── Control flow ──
         Op::Label(_) | Op::Branch(_) | Op::BranchScc1(_) |
@@ -202,7 +203,8 @@ pub fn op_latency(op: &Op) -> InsnLatency {
 
         // ── Wave-level reduce (composite: 5× ds_swizzle + 5× v_add/max) ──
         // Modeled as LDS since ds_swizzle dominates latency.
-        Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } => InsnLatency {
+        Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } |
+        Op::WaveReduceMinF32 { .. } => InsnLatency {
             class: InsnClass::XLANE, issue: 10, result: 20, recip_throughput: 10.0,
         },
 

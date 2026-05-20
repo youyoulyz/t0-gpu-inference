@@ -460,6 +460,8 @@ fn rename_op_vregs(op: &Op, offset: u32, rename_set: &HashSet<u32>) -> Op {
             Op::WaveReduceAddF32 { val: rename_v(*val), tmp: rename_v(*tmp) },
         Op::WaveReduceMaxF32 { val, tmp } =>
             Op::WaveReduceMaxF32 { val: rename_v(*val), tmp: rename_v(*tmp) },
+        Op::WaveReduceMinF32 { val, tmp } =>
+            Op::WaveReduceMinF32 { val: rename_v(*val), tmp: rename_v(*tmp) },
         // Scalar ops — pass through unchanged (SGPRs are not renamed)
         Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
         Op::SAndB32 { .. } | Op::SMulI32 { .. } | Op::SLshlB32 { .. } |

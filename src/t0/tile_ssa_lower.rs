@@ -914,6 +914,8 @@ fn lower_tile_op(
                 match cmp_op {
                     CmpOpKind::Lt => k.v_cmp_lt_u32(Operand::VReg(lv), Operand::VReg(rv)),
                     CmpOpKind::Ge => k.v_cmp_ge_u32(Operand::VReg(lv), Operand::VReg(rv)),
+                    CmpOpKind::Eq => k.v_cmp_eq_f32(lv, rv),
+                    CmpOpKind::Gt => k.v_cmp_gt_f32(lv, rv),
                     _ => return Err(format!("Unimplemented cmp: {:?}", cmp_op)),
                 }
                 // 物化 VCC boolean 到 VGPR: dst = VCC ? 1 : 0
@@ -1182,6 +1184,67 @@ fn lower_tile_op(
             // Step 6: wave reduce max on partial
             let tmp2 = k.alloc_vreg();
             k.wave_reduce_max_f32(partial, tmp2);
+            val_map.insert(*result, MachineVal::VReg(partial));
+        }
+
+        TileOp::WgReduceMin { result, src, block_size } => {
+            let va = get_vreg(k, val_map, *src)?;
+            let n_waves = (block_size + 31) / 32;
+
+            // Step 1: wave-level reduce min
+            let wave_min = k.alloc_vreg();
+            let tmp = k.alloc_vreg();
+            k.v_mov(wave_min, va);
+            k.wave_reduce_min_f32(wave_min, tmp);
+
+            // Step 2: allocate LDS
+            let lds_base = k.lds_size();
+            k.set_lds_size(lds_base + n_waves * 4);
+
+            // Step 3: wave leader writes to LDS
+            let wave_id = k.alloc_vreg();
+            let tid = k.thread_id_x();
+            k.v_lshrrev_b32(wave_id, 5, tid);
+            let lds_addr = k.alloc_vreg();
+            k.v_lshlrev_b32(lds_addr, 2, wave_id);
+            if lds_base > 0 {
+                let base_v = k.alloc_vreg();
+                k.v_mov_imm(base_v, lds_base as i32);
+                k.v_add_u32(lds_addr, lds_addr, base_v);
+            }
+
+            let lane_id = k.alloc_vreg();
+            k.v_and_b32_imm(lane_id, tid, 31);
+            k.v_cmp_eq_u32_imm(lane_id, 0);
+            let saved_exec = k.alloc_sreg();
+            k.save_exec(saved_exec);
+            k.ds_store_b32(lds_addr, wave_min, 0);
+            k.restore_exec(saved_exec);
+
+            // Step 4: barrier
+            k.wait_lgkmcnt(0);
+            k.s_barrier();
+
+            // Step 5: load partial mins, init with +inf
+            let partial = k.alloc_vreg();
+            k.v_mov_imm(partial, f32::INFINITY.to_bits() as i32);
+            k.v_cmp_lt_u32(Operand::VReg(lane_id), Operand::InlineInt(n_waves as i32));
+            let saved2 = k.alloc_sreg();
+            k.save_exec(saved2);
+            let load_addr = k.alloc_vreg();
+            k.v_lshlrev_b32(load_addr, 2, lane_id);
+            if lds_base > 0 {
+                let base_v2 = k.alloc_vreg();
+                k.v_mov_imm(base_v2, lds_base as i32);
+                k.v_add_u32(load_addr, load_addr, base_v2);
+            }
+            k.ds_load_b32(partial, load_addr, 0);
+            k.wait_lgkmcnt(0);
+            k.restore_exec(saved2);
+
+            // Step 6: wave reduce min on partial
+            let tmp2 = k.alloc_vreg();
+            k.wave_reduce_min_f32(partial, tmp2);
             val_map.insert(*result, MachineVal::VReg(partial));
         }
 

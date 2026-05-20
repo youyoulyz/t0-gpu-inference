@@ -382,6 +382,13 @@ fn translate_node(
             let block_size = kb.get_block_size();
             Ok(Some(f.wg_reduce_max(get(a)?, block_size)))
         }
+        BNode::WgReduceMinF32(a) => {
+            let block_size = kb.get_block_size();
+            Ok(Some(f.wg_reduce_min(get(a)?, block_size)))
+        }
+        BNode::CmpEqF32(a, b) => {
+            Ok(Some(f.cmp_eq(get(a)?, get(b)?)))
+        }
 
         // ── WMMA / BF16 ──
         BNode::ZeroAcc => Ok(Some(f.zero_acc())),

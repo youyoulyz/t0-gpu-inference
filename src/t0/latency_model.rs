@@ -155,6 +155,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
         Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
         Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
+        Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } |
         Op::VReadfirstlane { .. } => valu_simple(),
 
         // ── VALU complex: 2-cycle (mul, fma, integer mul, cvt, VOP3) ──
@@ -230,7 +231,8 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
 
         // ── Wave reductions: composite (5×swizzle + 5×add ≈ 24 VALU-norm) ──
         // Measured: ~254 shader cycles ≈ 24.2 VALU-norm
-        Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } => LatencyInfo {
+        Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } |
+        Op::WaveReduceMinF32 { .. } => LatencyInfo {
             pipeline: Pipeline::LDS, latency: 24, throughput: 24, is_mem: false, wait_counter: None,
         },
 

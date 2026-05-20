@@ -495,6 +495,8 @@ pub enum TileOp {
     WgReduceAdd { result: Value, src: Value, block_size: u32 },
     /// Workgroup-level max reduction (跨 wave，通过 LDS)
     WgReduceMax { result: Value, src: Value, block_size: u32 },
+    /// Workgroup-level min reduction (跨 wave，通过 LDS)
+    WgReduceMin { result: Value, src: Value, block_size: u32 },
 
     // ── Tile-Level 2D 操作（Triton 语义）──
     //
@@ -904,6 +906,10 @@ impl TileFunc {
         self.cmp(CmpOpKind::Ge, lhs, rhs)
     }
 
+    pub fn cmp_eq(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.cmp(CmpOpKind::Eq, lhs, rhs)
+    }
+
     /// 条件选择: cond ? true_val : false_val
     pub fn select(&mut self, cond: Value, true_val: Value, false_val: Value) -> Value {
         let ty = self.value_type(true_val).clone();
@@ -1028,6 +1034,13 @@ impl TileFunc {
     pub fn wg_reduce_max(&mut self, src: Value, block_size: u32) -> Value {
         let v = self.alloc_value(TileType::Scalar(ScalarDType::F32), None);
         self.push_op(TileOp::WgReduceMax { result: v, src, block_size });
+        v
+    }
+
+    /// Workgroup-level min reduction
+    pub fn wg_reduce_min(&mut self, src: Value, block_size: u32) -> Value {
+        let v = self.alloc_value(TileType::Scalar(ScalarDType::F32), None);
+        self.push_op(TileOp::WgReduceMin { result: v, src, block_size });
         v
     }
 
@@ -1497,6 +1510,8 @@ impl TileFunc {
                 format!("{}: F32 = wg_reduce_add({}, bs={})", result, src, block_size),
             TileOp::WgReduceMax { result, src, block_size } =>
                 format!("{}: F32 = wg_reduce_max({}, bs={})", result, src, block_size),
+            TileOp::WgReduceMin { result, src, block_size } =>
+                format!("{}: F32 = wg_reduce_min({}, bs={})", result, src, block_size),
             TileOp::Cmp { result, op, lhs, rhs } =>
                 format!("{}: Bool = {:?}({}, {})", result, op, lhs, rhs),
             TileOp::Select { result, cond, true_val, false_val } =>
@@ -1625,6 +1640,7 @@ fn op_result(op: &TileOp) -> Option<Value> {
         TileOp::WmmaF32 { result, .. } | TileOp::ExtractF32 { result, .. } |
         TileOp::SplatFragment { result, .. } |
         TileOp::WgReduceAdd { result, .. } | TileOp::WgReduceMax { result, .. } |
+        TileOp::WgReduceMin { result, .. } |
         TileOp::TileLoad2D { result, .. } | TileOp::TileDot { result, .. } => Some(*result),
     }
 }

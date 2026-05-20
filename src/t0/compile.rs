@@ -567,6 +567,12 @@ impl T0Kernel {
         self.ops.push(Op::WaveReduceMaxF32 { val, tmp });
     }
 
+    /// Wave32 min reduction: `val` ← min_across_wave32(val)
+    /// `val` is modified in-place to hold the min. `tmp` is scratch.
+    pub fn wave_reduce_min_f32(&mut self, val: VReg, tmp: VReg) {
+        self.ops.push(Op::WaveReduceMinF32 { val, tmp });
+    }
+
     /// Pack two f32 values into bf16x2: dst = (bf16(src1) << 16) | bf16(src0)
     pub fn cvt_pk_bf16_f32(&mut self, dst: VReg, src0: VReg, src1: VReg) {
         self.ops.push(Op::CvtPkBf16F32 { dst, src0, src1 });
@@ -625,6 +631,16 @@ impl T0Kernel {
     /// v_cmp_ge_u32: set VCC where src0 >= src1
     pub fn v_cmp_ge_u32(&mut self, src0: Operand, src1: Operand) {
         self.ops.push(Op::VCmpGeU32 { src0, src1 });
+    }
+
+    /// v_cmp_eq_f32: set VCC where src0 == src1
+    pub fn v_cmp_eq_f32(&mut self, src0: VReg, src1: VReg) {
+        self.ops.push(Op::VCmpEqF32 { src0: Operand::VReg(src0), src1: Operand::VReg(src1) });
+    }
+
+    /// v_cmp_gt_f32: set VCC where src0 > src1
+    pub fn v_cmp_gt_f32(&mut self, src0: VReg, src1: VReg) {
+        self.ops.push(Op::VCmpGtF32 { src0: Operand::VReg(src0), src1: Operand::VReg(src1) });
     }
 
     /// v_cmp_gt_f32 vcc, src, 0 — set VCC where src > 0.0 (ReLU mask)

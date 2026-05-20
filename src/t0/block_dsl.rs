@@ -177,6 +177,7 @@ pub enum BNode {
     GeU32(BVal, BVal),        // a >= b (unsigned) → VCC mask
     CmpLtF32(BVal, BVal),     // a < b (float) → VCC mask
     CmpGtF32(BVal, BVal),     // a > b (float) → VCC mask
+    CmpEqF32(BVal, BVal),     // a == b (float) → VCC mask
     AndBool(BVal, BVal),      // mask_a & mask_b → combined mask
     /// Conditional select: dst = mask ? true_val : false_val  (v_cndmask)
     Select { mask: BVal, true_val: BVal, false_val: BVal },
@@ -240,6 +241,7 @@ pub enum BNode {
     // ── WG 级归约（跨 wave，通过 LDS）──
     WgReduceAddF32(BVal),
     WgReduceMaxF32(BVal),
+    WgReduceMinF32(BVal),
 
     // ── WMMA（Wave Matrix Multiply Accumulate）──
     /// Allocate 8×f32 zero-initialized accumulator (8-aligned VGPRs)
@@ -288,7 +290,7 @@ impl BNode {
             BNode::AddU32(..) | BNode::SubU32(..) | BNode::MulU32(..) => BType::U32,
             BNode::ShrConstU32(..) | BNode::ShlConstU32(..) => BType::U32,
             BNode::AndConstU32(..) | BNode::OrConstU32(..) | BNode::XorConstU32(..) => BType::U32,
-            BNode::LtU32(..) | BNode::GeU32(..) | BNode::CmpLtF32(..) | BNode::CmpGtF32(..) | BNode::AndBool(..) => BType::Mask,
+            BNode::LtU32(..) | BNode::GeU32(..) | BNode::CmpLtF32(..) | BNode::CmpGtF32(..) | BNode::CmpEqF32(..) | BNode::AndBool(..) => BType::Mask,
             BNode::Select { .. } => BType::F32, // assumes f32 select; type depends on operands
             BNode::Load { .. } => BType::F32,
             BNode::LoadU32 { .. } => BType::U32,
@@ -314,7 +316,7 @@ impl BNode {
             BNode::ForAccPhi { .. } => BType::F32,    // accumulator (current value)
             BNode::ForAccEnd { .. } => BType::U32,    // void
             BNode::ForAccResult { .. } => BType::F32, // final accumulator value
-            BNode::WgReduceAddF32(_) | BNode::WgReduceMaxF32(_) => BType::F32,
+            BNode::WgReduceAddF32(_) | BNode::WgReduceMaxF32(_) | BNode::WgReduceMinF32(_) => BType::F32,
             BNode::ZeroAcc => BType::F32x8,
             BNode::CvtPkBf16F32 { .. } => BType::U32, // bf16x2 packed in u32
             BNode::Wmma { .. } => BType::F32x8,
@@ -439,6 +441,10 @@ impl BVal {
     /// Float greater-than comparison: a > b → mask
     pub fn gt_f32(self, kb: &mut BlockKernel, other: BVal) -> BVal {
         kb.push(BNode::CmpGtF32(self, other))
+    }
+    /// Float equality comparison: a == b → mask
+    pub fn eq_f32(self, kb: &mut BlockKernel, other: BVal) -> BVal {
+        kb.push(BNode::CmpEqF32(self, other))
     }
     /// Conditional select: mask ? self : other
     pub fn select(self, kb: &mut BlockKernel, true_val: BVal, false_val: BVal) -> BVal {
@@ -980,6 +986,14 @@ impl BlockKernel {
     pub fn wg_reduce_max(&mut self, val: BVal) -> BVal {
         assert_eq!(self.types[val.0], BType::F32, "wg_reduce_max: val must be F32");
         self.push(BNode::WgReduceMaxF32(val))
+    }
+
+    /// WG-level min reduction (cross-wave via LDS)
+    ///
+    /// Same pattern as wg_reduce_sum but uses min instead of add.
+    pub fn wg_reduce_min(&mut self, val: BVal) -> BVal {
+        assert_eq!(self.types[val.0], BType::F32, "wg_reduce_min: val must be F32");
+        self.push(BNode::WgReduceMinF32(val))
     }
 
     // ── Tile-Level Operations ──

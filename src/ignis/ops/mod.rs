@@ -15,3 +15,4 @@ pub mod checkpoint;
 pub mod psi_activation;
 pub mod gemm_autotune;
 pub mod fusion;
+pub mod argmax;
