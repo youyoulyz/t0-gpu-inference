@@ -328,7 +328,11 @@ impl GpuRuntime {
 
     /// Dispatch a kernel asynchronously (no wait).
     ///
-    /// Returns the slot index used (for debugging).
+    /// Uses `submit` (with ring space safety check + SYSTEM fence) to ensure
+    /// the ring buffer doesn't overflow. The caller is responsible for
+    /// final synchronization via `wait_idle()` or `synchronize()`.
+    ///
+    /// Returns the kernarg slot index (for debugging).
     pub fn dispatch_async(
         &self,
         kernel: &GpuKernel,

@@ -61,13 +61,14 @@ fn main() -> Result<(), String> {
             let gpu_kernel = &kernel_cache[&cfg_name];
 
             // 3. Allocate buffers
+            // Note: y_buf uses alloc_vram_host for CPU readback on small BAR systems
             let x_bytes = (m as usize) * (k as usize) * 2;
             let w_bytes = (n as usize) * (k as usize) * 2;
             let sk = cfg.split_k.unwrap_or(1);
             let y_bytes = (m as usize) * (n as usize) * 4 * sk as usize;
             let x_buf = device.alloc_vram(x_bytes)?;
             let w_buf = device.alloc_vram(w_bytes)?;
-            let y_buf = device.alloc_vram(y_bytes)?;
+            let y_buf = device.alloc_vram_host(y_bytes)?;
 
             // Fill with bf16(1.0) = 0x3F80
             let x_data = vec![0x3F80u16; (m * k) as usize];
@@ -126,6 +127,10 @@ fn main() -> Result<(), String> {
                     std::ptr::copy_nonoverlapping(
                         y_buf.host_ptr as *const f32, y_out.as_mut_ptr(), y_elems);
                 }
+            }
+            // Debug: print first few output values
+            if m <= 256 && n <= 256 {
+                eprintln!("  [DEBUG] y_out[0..4] = {:?}, expected = {}", &y_out[..4.min(y_elems)], k);
             }
             // For bf16(1.0) × bf16(1.0), expected = K (each of K elements = 1.0*1.0)
             let expected = k as f32;

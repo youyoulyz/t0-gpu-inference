@@ -24,7 +24,12 @@ pub mod tokenizer;
 pub mod lr_scheduler;
 pub mod grad_clip;
 pub mod loss_scaler;
+pub mod kv_cache;
 
 // Tests
 #[cfg(test)]
 pub mod tests;
+
+// KV cache integration tests (correctness + performance)
+#[cfg(test)]
+mod kv_cache_tests;

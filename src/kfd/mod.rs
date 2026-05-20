@@ -569,21 +569,62 @@ impl KfdDevice {
     }
 
     /// Allocate VRAM buffer (writable, public, CPU-visible via mmap)
+    /// On small BAR systems (no Resizable BAR), PUBLIC VRAM allocation fails.
+    /// In that case, fall back to non-public VRAM (GPU-only, no CPU readback).
     pub fn alloc_vram(self: &Arc<Self>, size: usize) -> Result<GpuBuffer, String> {
-        self.alloc_memory(size,
-            KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+        let flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
             KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-            KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC)
+            KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
+        match self.alloc_memory(size, flags) {
+            Ok(buf) => Ok(buf),
+            Err(e) if e.contains("Invalid argument") || e.contains("EINVAL") => {
+                // Small BAR: host-visible VRAM not available, fall back to non-public VRAM
+                eprintln!("[KFD] alloc_vram PUBLIC failed ({e}), falling back to non-public VRAM (small BAR)");
+                let fallback_flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+                    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
+                self.alloc_memory(size, fallback_flags)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Allocate CPU-host-visible buffer.
+    /// On systems with large BAR (Resizable BAR), uses PUBLIC VRAM for best performance.
+    /// On small BAR systems, falls back to non-public VRAM (CPU readback works via DRM mmap).
+    pub fn alloc_vram_host(self: &Arc<Self>, size: usize) -> Result<GpuBuffer, String> {
+        // Try VRAM+PUBLIC first (large BAR systems)
+        let vram_flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+            KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+            KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
+        match self.alloc_memory(size, vram_flags) {
+            Ok(buf) => Ok(buf),
+            Err(_) => {
+                // Small BAR: fall back to non-public VRAM
+                // The DRM mmap path still provides CPU access on Linux amdgpu
+                self.alloc_vram(size)
+            }
+        }
     }
 
     /// Allocate executable VRAM (for kernel machine code)
     /// After writing code, call `hdp_flush()` or read back one byte to flush HDP.
+    /// On small BAR systems, falls back to non-public VRAM.
     pub fn alloc_code(self: &Arc<Self>, size: usize) -> Result<GpuBuffer, String> {
-        self.alloc_memory(size,
-            KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+        let flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
             KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
             KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
-            KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC)
+            KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
+        match self.alloc_memory(size, flags) {
+            Ok(buf) => Ok(buf),
+            Err(e) if e.contains("Invalid argument") || e.contains("EINVAL") => {
+                eprintln!("[KFD] alloc_code PUBLIC failed ({e}), retrying without PUBLIC (small BAR fallback)");
+                let fallback_flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+                    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+                    KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
+                self.alloc_memory(size, fallback_flags)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Allocate GTT memory (host-visible, for kernargs, signals, etc.)
