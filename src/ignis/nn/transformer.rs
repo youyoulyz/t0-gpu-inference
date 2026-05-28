@@ -245,25 +245,33 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
+        eprintln!("  [L{}] rmsnorm_attn", layer_idx);
 
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
 
+        eprintln!("  [L{}] qkv_proj", layer_idx);
         // Q/K/V projections
         let q = self.wq.forward(&h)?;  // [seq, q_dim]
         let k = self.wk.forward(&h)?;  // [seq, kv_dim]
         let v = self.wv.forward(&h)?;  // [seq, kv_dim]
 
+        eprintln!("  [L{}] qk_norm", layer_idx);
         // QK-norm: per-head RMSNorm on Q and K
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
 
-        // RoPE: apply rotary position embedding
-        let q = ops::rope::rope_forward(&q, pos, self.rope_theta, &self.runtime)?;
-        let k = ops::rope::rope_forward(&k, pos, self.rope_theta, &self.runtime)?;
+        eprintln!("  [L{}] rope", layer_idx);
+        // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
+        let q_2d = q.reshape(&[seq_len * self.n_heads, self.d_head]);
+        let k_2d = k.reshape(&[seq_len * self.n_kv_heads, self.d_head]);
+        let q_2d = ops::rope::rope_forward(&q_2d, pos, self.rope_theta, &self.runtime)?;
+        let k_2d = ops::rope::rope_forward(&k_2d, pos, self.rope_theta, &self.runtime)?;
+        let q = q_2d.reshape(&[seq_len, self.q_dim]);
+        let k = k_2d.reshape(&[seq_len, self.kv_dim]);
 
+        eprintln!("  [L{}] kv_cache", layer_idx);
         // Store K/V in cache
-        // K/V shape from qk_norm: [seq, kv_dim]. Reshape to [seq, kv_heads, head_dim] for cache.
         let kv_heads = self.n_kv_heads;
         let hd = self.d_head;
         let k_3d = k.reshape(&[seq_len, kv_heads, hd]);
@@ -277,6 +285,7 @@ impl TransformerLayer {
             kv_cache.advance_by(seq_len);
         }
 
+        eprintln!("  [L{}] attention", layer_idx);
         // Read full K/V history from cache into CPU tensors
         let kv_len = kv_cache.position();
         let k_data = kv_cache.read_k_layer(&self.runtime, layer_idx);
@@ -292,6 +301,7 @@ impl TransformerLayer {
             &self.runtime,
         )?;
 
+        eprintln!("  [L{}] o_proj + residual", layer_idx);
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
         let x2 = ops::add::add(x, &proj_out, device)?;

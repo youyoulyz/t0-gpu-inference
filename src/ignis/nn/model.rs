@@ -145,4 +145,138 @@ impl LanguageModel {
     pub fn param_count(&self) -> usize {
         self.all_parameters().iter().map(|t| t.numel()).sum()
     }
+
+    /// Prefill: process all prompt tokens at once, filling the KV cache.
+    ///
+    /// Returns logits for the last token position: [vocab_size] f32.
+    pub fn forward_prefill(
+        &mut self,
+        ids: &[u32],
+        kv_cache: &mut super::super::kv_cache::KvCache,
+    ) -> Result<Tensor, String> {
+        let device = &self.runtime.device;
+        let seq_len = ids.len();
+
+        // Embed all tokens at once via CPU (reads weight table once)
+        let mut h = self.embedding.forward_cpu(ids)?;
+
+        // Run through all transformer layers with KV cache
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            h = layer.forward_inference(&h, 0, layer_idx, kv_cache)?;
+        }
+
+        // Final RMSNorm
+        h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
+
+        // Take last token's hidden state: [1, hidden_size]
+        let hidden = self.config.hidden_size;
+        let last_hidden_data = {
+            let full = h.to_f32_vec();
+            let start = (seq_len - 1) * hidden;
+            full[start..start + hidden].to_vec()
+        };
+        let last_hidden = Tensor::from_f32(&self.runtime, &last_hidden_data, &[1, hidden], "last_hidden")?;
+
+        // LM head → logits [1, vocab_size]
+        self.lm_head.forward(&last_hidden)
+    }
+
+    /// Decode: process a single new token with KV cache, return logits.
+    ///
+    /// Returns logits: [vocab_size] f32.
+    pub fn forward_decode(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        kv_cache: &mut super::super::kv_cache::KvCache,
+    ) -> Result<Tensor, String> {
+        let device = &self.runtime.device;
+
+        // Embed single token via CPU
+        let mut h = self.embedding.forward_cpu(&[token_id])?;
+
+        // Run through all transformer layers
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            h = layer.forward_inference(&h, pos, layer_idx, kv_cache)?;
+        }
+
+        // Final RMSNorm
+        h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
+
+        // LM head → logits [1, vocab_size]
+        self.lm_head.forward(&h)
+    }
+
+    /// Generate text autoregressively.
+    ///
+    /// # Arguments
+    /// - `prompt_ids`: tokenized prompt
+    /// - `max_tokens`: maximum new tokens to generate
+    /// - `temperature`: sampling temperature (<=0 for greedy)
+    /// - `top_p`: nucleus sampling threshold
+    /// - `eos_id`: end-of-sequence token ID
+    /// - `kv_cache`: pre-allocated KV cache
+    ///
+    /// # Returns
+    /// Generated token IDs (excluding prompt).
+    pub fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        eos_id: u32,
+        kv_cache: &mut super::super::kv_cache::KvCache,
+    ) -> Result<Vec<u32>, String> {
+        kv_cache.reset();
+
+        // Prefill phase: process entire prompt
+        eprintln!("[Generate] Prefilling {} prompt tokens...", prompt_ids.len());
+        let t_prefill = std::time::Instant::now();
+        let logits = self.forward_prefill(prompt_ids, kv_cache)?;
+        eprintln!("[Generate] Prefill done in {:.1}s", t_prefill.elapsed().as_secs_f64());
+        let mut generated = Vec::new();
+
+        // Sample first token from prefill logits
+        let next_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
+        generated.push(next_token);
+
+        if next_token == eos_id {
+            return Ok(generated);
+        }
+
+        // Decode phase: generate tokens one at a time
+        let start_pos = prompt_ids.len();
+        for step in 0..max_tokens - 1 {
+            let t0 = std::time::Instant::now();
+            let pos = start_pos + step;
+            let logits = self.forward_decode(next_token, pos, kv_cache)?;
+            let decode_ms = t0.elapsed().as_millis();
+
+            let next_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
+            generated.push(next_token);
+
+            if next_token == eos_id {
+                eprintln!("[Generate] EOS at step {}", step + 1);
+                break;
+            }
+
+            eprint!("[tok {}] {}ms  ", step + 1, decode_ms);
+            if (step + 1) % 5 == 0 { eprintln!(); }
+        }
+        eprintln!("[Generate] Done. {} tokens generated.", generated.len());
+
+        Ok(generated)
+    }
+}
+
+/// Upload u32 slice to GPU buffer.
+fn upload_u32(runtime: &Arc<GpuRuntime>, data: &[u32]) -> Result<crate::kfd::GpuBuffer, String> {
+    let bytes = data.len() * 4;
+    let buf = runtime.device.alloc_vram(bytes)?;
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
+    };
+    buf.write_bytes(0, byte_slice);
+    Ok(buf)
 }

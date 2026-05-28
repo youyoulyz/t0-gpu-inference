@@ -300,15 +300,33 @@ impl Tensor {
 
     /// Read data back to CPU as f32 vector.
     /// Synchronizes GPU before reading to ensure all dispatches are complete.
+    /// Handles both F32 and BF16 tensors (bf16 is converted to f32 on read).
     pub fn to_f32_vec(&self) -> Vec<f32> {
         // Lazy sync: ensure all GPU work is done before CPU reads
         let _ = self.runtime.queue.wait_idle();
         let n = self.numel();
-        let mut data = vec![0f32; n];
-        self.buf.read(unsafe {
-            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-        });
-        data
+
+        match self.dtype {
+            DType::BF16 => {
+                // Read raw bf16 bytes, then convert each 2-byte element to f32
+                let mut raw = vec![0u8; n * 2];
+                self.buf.read(&mut raw);
+                let mut data = vec![0f32; n];
+                for i in 0..n {
+                    let bits = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                    data[i] = f32::from_bits((bits as u32) << 16);
+                }
+                data
+            }
+            _ => {
+                // F32 / U32: read raw bytes as f32
+                let mut data = vec![0f32; n];
+                self.buf.read(unsafe {
+                    std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
+                });
+                data
+            }
+        }
     }
 
     /// Read a single f32 value (index 0).

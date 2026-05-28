@@ -21,6 +21,8 @@ pub struct Linear {
     pub in_features: usize,
     pub out_features: usize,
     runtime: Arc<GpuRuntime>,
+    /// Cached bf16 transposed weight [out_features, in_features] for GEMM
+    cached_wt_bf16: std::sync::OnceLock<Option<crate::kfd::GpuBuffer>>,
 }
 
 #[cfg(feature = "rocm")]
@@ -53,6 +55,7 @@ impl Linear {
             in_features,
             out_features,
             runtime: runtime.clone(),
+            cached_wt_bf16: std::sync::OnceLock::new(),
         })
     }
 
@@ -65,6 +68,7 @@ impl Linear {
             out_features: shape[1],
             weight,
             runtime: runtime.clone(),
+            cached_wt_bf16: std::sync::OnceLock::new(),
         }
     }
 }
@@ -72,8 +76,26 @@ impl Linear {
 #[cfg(feature = "rocm")]
 impl Module for Linear {
     fn forward(&self, input: &Tensor) -> Result<Tensor, String> {
-        // Y = input @ weight using WMMA GEMM
-        super::super::ops::bf16_matmul::matmul(input, &self.weight, &self.runtime.device)
+        // Y = input @ weight using WMMA GEMM with cached bf16 weight
+        let m = input.shape()[0];
+        let k = self.in_features;
+        let n = self.out_features;
+
+        // Get or compute cached bf16 transposed weight
+        let wt_bf16 = self.cached_wt_bf16.get_or_init(|| {
+            // Convert weight f32 → bf16 and transpose to [N, K]
+            let wt = super::super::ops::bf16_matmul::precompute_wt_bf16(
+                &self.runtime, self.weight.buffer(), k, n,
+            );
+            Some(wt.ok()).flatten()
+        });
+
+        if let Some(wt) = wt_bf16 {
+            super::super::ops::bf16_matmul::matmul_with_wt_bf16(input, wt, m, k, n, &self.runtime)
+        } else {
+            // Fallback to non-cached path
+            super::super::ops::bf16_matmul::matmul(input, &self.weight, &self.runtime.device)
+        }
     }
 
     fn parameters(&self) -> Vec<&Tensor> {

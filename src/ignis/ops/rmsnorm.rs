@@ -32,20 +32,23 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
 
     assert_eq!(gamma.numel(), dim, "rmsnorm: gamma dim mismatch");
 
-    // GPU forward via block_dsl: 1 wave per row
+    // GPU forward via block_dsl: use enough threads so each lane handles few elements
+    // WG_SIZE = next_power_of_two(dim) capped at 256, so epl ≤ 2
+    let wg_size: u32 = (dim as u32).next_power_of_two().min(256).max(32);
+    let epl = ((dim as u32 + wg_size - 1) / wg_size) as u32; // ceil(dim / wg_size)
     let out_buf = runtime.alloc_f32(rows * dim)?;
     let rms_buf = runtime.alloc_f32(rows)?; // save inv_rms for backward
 
     // Build or reuse kernel
     let kernel = {
-        let name = format!("bdsl_rmsnorm_d{}", dim);
+        let name = format!("bdsl_rmsnorm_d{}_wg{}", dim, wg_size);
         let cached = runtime.get_kernel(&name);
         if let Some(k) = cached {
             k
         } else {
             use crate::t0::block_dsl::BlockKernel;
             use crate::t0::ir::Target;
-            let mut kb = BlockKernel::new(&name, 32); // 1 wave per WG
+            let mut kb = BlockKernel::new(&name, wg_size);
             let x_ptr = kb.arg_ptr("x");
             let gamma_ptr = kb.arg_ptr("gamma");
             let out_ptr = kb.arg_ptr("out");
@@ -59,14 +62,13 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
             let row_base = row_id.mul(&mut kb, dim_arg);
 
             // Pass 1: accumulate sum of x²
-            // Each lane handles elements lane_id, lane_id+32, lane_id+64, ...
-            let epl = ((dim + 31) / 32) as u32; // ceil(dim/32)
+            // Each lane handles elements lane_id, lane_id+wg_size, lane_id+2*wg_size, ...
             let mut sum_sq = kb.const_f32(0.0);
             for j in 0..epl {
                 let col = if j == 0 {
                     lane_id
                 } else {
-                    let offset = kb.const_u32(j * 32);
+                    let offset = kb.const_u32(j * wg_size);
                     lane_id.add(&mut kb, offset)
                 };
                 let idx = row_base.add(&mut kb, col);
@@ -97,7 +99,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                 let col = if j == 0 {
                     lane_id
                 } else {
-                    let offset = kb.const_u32(j * 32);
+                    let offset = kb.const_u32(j * wg_size);
                     lane_id.add(&mut kb, offset)
                 };
                 let idx = row_base.add(&mut kb, col);
@@ -121,7 +123,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
         rms_buf.gpu_addr() => u64,
         dim as u32 => u32
     ];
-    runtime.dispatch(&kernel, [rows as u32 * 32, 1, 1], &ka)?;
+    runtime.dispatch(&kernel, [rows as u32 * wg_size, 1, 1], &ka)?;
 
     let out_arc = Arc::new(out_buf);
     let output = Tensor::from_buffer(out_arc, &runtime, &shape, super::super::tensor::DType::F32, "rmsnorm_out");
@@ -151,14 +153,16 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                 // ═══ dx: block_dsl GPU kernel (1 wave per row) ═══
                 if x_needs {
                     let dx_kernel = {
-                        let name = format!("bdsl_rmsnorm_dx_d{}", d);
+                        let bwd_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                        let bwd_epl = ((d as u32 + bwd_wg - 1) / bwd_wg) as u32;
+                        let name = format!("bdsl_rmsnorm_dx_d{}_wg{}", d, bwd_wg);
                         let cached = runtime.get_kernel(&name);
                         if let Some(k) = cached {
                             k
                         } else {
                             use crate::t0::block_dsl::BlockKernel;
                             use crate::t0::ir::Target;
-                            let mut kb = BlockKernel::new(&name, 32);
+                            let mut kb = BlockKernel::new(&name, bwd_wg);
                             let dy_ptr = kb.arg_ptr("dy");
                             let x_ptr = kb.arg_ptr("x");
                             let gamma_ptr = kb.arg_ptr("gamma");
@@ -177,11 +181,10 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                             let inv_rms3 = inv_rms.mul(&mut kb, inv_rms).mul(&mut kb, inv_rms);
 
                             // Pass 1: dot_sum = sum(dy * gamma * x)
-                            let epl = ((d + 31) / 32) as u32;
                             let mut dot = kb.const_f32(0.0);
-                            for j in 0..epl {
+                            for j in 0..bwd_epl {
                                 let col = if j == 0 { lane_id } else {
-                                    let o = kb.const_u32(j * 32);
+                                    let o = kb.const_u32(j * bwd_wg);
                                     lane_id.add(&mut kb, o)
                                 };
                                 let mask = col.lt(&mut kb, dim_arg);
@@ -198,9 +201,9 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                             let dim_f = dim_arg.to_f32(&mut kb);
                             let inv_dim = dim_f.rcp(&mut kb);
                             let scale2 = dot.mul(&mut kb, inv_rms3).mul(&mut kb, inv_dim);
-                            for j in 0..epl {
+                            for j in 0..bwd_epl {
                                 let col = if j == 0 { lane_id } else {
-                                    let o = kb.const_u32(j * 32);
+                                    let o = kb.const_u32(j * bwd_wg);
                                     lane_id.add(&mut kb, o)
                                 };
                                 let mask = col.lt(&mut kb, dim_arg);
@@ -221,6 +224,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                     };
 
                     let dx_buf = runtime.alloc_f32(r * d)?;
+                    let bwd_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
                     let ka = crate::kernargs![
                         grad_output.gpu_addr() => u64,
                         saved[0].gpu_addr() => u64,  // x
@@ -229,7 +233,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                         dx_buf.gpu_addr() => u64,
                         d as u32 => u32
                     ];
-                    runtime.dispatch(&dx_kernel, [r as u32 * 32, 1, 1], &ka)?;
+                    runtime.dispatch(&dx_kernel, [r as u32 * bwd_wg, 1, 1], &ka)?;
                     grads.push(Some(Arc::new(dx_buf)));
                 } else {
                     grads.push(None);
@@ -238,14 +242,16 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                 // ═══ dgamma: block_dsl GPU kernel (atomic add across rows) ═══
                 if g_needs {
                     let dg_kernel = {
-                        let name = format!("bdsl_rmsnorm_dg_d{}", d);
+                        let dg_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                        let dg_epl = ((d as u32 + dg_wg - 1) / dg_wg) as u32;
+                        let name = format!("bdsl_rmsnorm_dg_d{}_wg{}", d, dg_wg);
                         let cached = runtime.get_kernel(&name);
                         if let Some(k) = cached {
                             k
                         } else {
                             use crate::t0::block_dsl::BlockKernel;
                             use crate::t0::ir::Target;
-                            let mut kb = BlockKernel::new(&name, 32);
+                            let mut kb = BlockKernel::new(&name, dg_wg);
                             let dy_ptr = kb.arg_ptr("dy");
                             let x_ptr = kb.arg_ptr("x");
                             let irms_ptr = kb.arg_ptr("inv_rms");
@@ -261,10 +267,9 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                             let inv_rms = kb.load(irms_ptr, row_id, always);
 
                             // dgamma[c] += dy[row,c] * x[row,c] * inv_rms
-                            let epl = ((d + 31) / 32) as u32;
-                            for j in 0..epl {
+                            for j in 0..dg_epl {
                                 let col = if j == 0 { lane_id } else {
-                                    let o = kb.const_u32(j * 32);
+                                    let o = kb.const_u32(j * dg_wg);
                                     lane_id.add(&mut kb, o)
                                 };
                                 let mask = col.lt(&mut kb, dim_arg);
@@ -282,6 +287,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
 
                     let dg_buf = runtime.alloc_f32(d)?;
                     dg_buf.zero();
+                    let dg_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
                     let ka = crate::kernargs![
                         grad_output.gpu_addr() => u64,
                         saved[0].gpu_addr() => u64,  // x
@@ -289,7 +295,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                         dg_buf.gpu_addr() => u64,
                         d as u32 => u32
                     ];
-                    runtime.dispatch(&dg_kernel, [r as u32 * 32, 1, 1], &ka)?;
+                    runtime.dispatch(&dg_kernel, [r as u32 * dg_wg, 1, 1], &ka)?;
                     grads.push(Some(Arc::new(dg_buf)));
                 } else {
                     grads.push(None);

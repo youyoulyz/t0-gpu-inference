@@ -375,6 +375,39 @@ pub fn load_qwen3_into_model(
 
     eprintln!("[Safetensors] Loaded {} tensors, assigning to model...", all_tensors.len());
 
+    // Helper: transpose a 2D bf16 tensor [M, N] → [N, M] as f32
+    // Reads bf16 bytes, converts to f32 during transpose, uploads as f32.
+    fn transpose_bf16(t: &crate::ignis::tensor::Tensor, runtime: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>) -> crate::ignis::tensor::Tensor {
+        let shape = t.shape();
+        assert_eq!(shape.len(), 2, "transpose_bf16: expected 2D");
+        let m = shape[0];
+        let n = shape[1];
+
+        // Read raw bf16 bytes from GPU
+        let _ = runtime.wait_idle();
+        let bf16_bytes = m * n * 2;
+        let mut raw = vec![0u8; bf16_bytes];
+        t.buffer().read(&mut raw);
+
+        // Convert bf16→f32 while transposing: raw[i*n+j] → out[j*m+i]
+        let mut out = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                let bits = u16::from_le_bytes([raw[idx * 2], raw[idx * 2 + 1]]);
+                let val = f32::from_bits((bits as u32) << 16);
+                out[j * m + i] = val;
+            }
+        }
+
+        // Upload transposed f32 data
+        let buf = runtime.upload_f32(&out).expect("transpose upload");
+        crate::ignis::tensor::Tensor::from_buffer(
+            std::sync::Arc::new(buf), runtime, &[n, m],
+            crate::ignis::tensor::DType::F32, "transposed"
+        )
+    }
+
     // Assign embedding weights
     if let Some(embed_weight) = all_tensors.get("model.embed_tokens.weight") {
         model.embedding.weight = embed_weight.clone();
@@ -387,29 +420,29 @@ pub fn load_qwen3_into_model(
     for (layer_idx, layer) in model.layers.iter_mut().enumerate() {
         let prefix = format!("model.layers.{}", layer_idx);
 
-        // Attention projections
+        // Attention projections — transpose from HF [out, in] to our [in, out]
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
-            layer.wq.weight = w.clone();
+            layer.wq.weight = transpose_bf16(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
-            layer.wk.weight = w.clone();
+            layer.wk.weight = transpose_bf16(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
-            layer.wv.weight = w.clone();
+            layer.wv.weight = transpose_bf16(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
-            layer.wo.weight = w.clone();
+            layer.wo.weight = transpose_bf16(w, runtime);
         }
 
-        // FFN projections
+        // FFN projections — transpose from HF [out, in] to our [in, out]
         if let Some(w) = all_tensors.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
-            layer.w_gate.weight = w.clone();
+            layer.w_gate.weight = transpose_bf16(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.mlp.up_proj.weight", prefix)) {
-            layer.w_up.weight = w.clone();
+            layer.w_up.weight = transpose_bf16(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.mlp.down_proj.weight", prefix)) {
-            layer.w_down.weight = w.clone();
+            layer.w_down.weight = transpose_bf16(w, runtime);
         }
 
         // RMSNorm gammas
@@ -437,9 +470,9 @@ pub fn load_qwen3_into_model(
         eprintln!("[Safetensors] Assigned model.norm.weight");
     }
 
-    // LM head — either from file or tied to embedding
+    // LM head — transpose from HF [vocab, hidden] to our [hidden, vocab]
     if let Some(w) = all_tensors.get("lm_head.weight") {
-        model.lm_head.weight = w.clone();
+        model.lm_head.weight = transpose_bf16(w, runtime);
         eprintln!("[Safetensors] Assigned lm_head.weight");
     } else if model.config.tie_word_embeddings {
         // Weight tying: lm_head shares embedding weight
@@ -503,10 +536,8 @@ pub fn load_qwen3_model_from_dir(
     let paths = discover_safetensors_files(dir)?;
     load_qwen3_into_model(runtime, &paths, &mut model)?;
 
-    // Tie weights if needed (after loading, so embedding.weight is the real one)
-    if config.tie_word_embeddings {
-        model.tie_lm_head();
-    }
+    // Note: tie_word_embeddings is handled inside load_qwen3_into_model
+    // (lm_head.weight is loaded from file and transposed, or tied to embedding)
 
     Ok(model)
 }

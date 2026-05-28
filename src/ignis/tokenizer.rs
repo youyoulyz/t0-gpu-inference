@@ -169,3 +169,59 @@ impl VocabTokenizer {
 
     pub fn vocab_size(&self) -> usize { self.vocab.len() }
 }
+
+/// HuggingFace tokenizer wrapper using the `tokenizers` crate.
+///
+/// Loads a `tokenizer.json` file from HuggingFace model directories.
+/// Supports BPE tokenization used by Qwen, LLaMA, etc.
+pub struct HfTokenizer {
+    inner: tokenizers::Tokenizer,
+}
+
+impl HfTokenizer {
+    /// Load from a tokenizer.json file path.
+    pub fn from_file(path: &str) -> Result<Self, String> {
+        let inner = tokenizers::Tokenizer::from_file(path)
+            .map_err(|e| format!("Failed to load tokenizer from {}: {}", path, e))?;
+        Ok(Self { inner })
+    }
+
+    /// Load from a model directory (looks for tokenizer.json).
+    pub fn from_dir(dir: &str) -> Result<Self, String> {
+        let path = format!("{}/tokenizer.json", dir);
+        Self::from_file(&path)
+    }
+
+    /// Encode text to token IDs.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let encoding = self.inner.encode(text, false)
+            .expect("tokenizer encode failed");
+        encoding.get_ids().to_vec()
+    }
+
+    /// Encode text with added special tokens (e.g., chat template).
+    pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
+        let encoding = self.inner.encode(text, true)
+            .expect("tokenizer encode failed");
+        encoding.get_ids().to_vec()
+    }
+
+    /// Decode token IDs to text.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        self.inner.decode(ids, true)
+            .unwrap_or_else(|_| "<decode error>".to_string())
+    }
+
+    /// Encode a single special token by its string form.
+    /// Returns the token ID if found.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        let encoding = self.inner.encode(token, true).ok()?;
+        let ids = encoding.get_ids();
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    }
+
+    /// Vocab size.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+}

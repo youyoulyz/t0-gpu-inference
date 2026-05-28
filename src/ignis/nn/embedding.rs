@@ -20,6 +20,8 @@ pub struct Embedding {
     pub vocab_size: usize,
     pub dim: usize,
     runtime: Arc<GpuRuntime>,
+    /// CPU-side cached weight table (lazily populated on first forward_cpu call)
+    cached_table: std::sync::RwLock<Option<Vec<f32>>>,
 }
 
 #[cfg(feature = "rocm")]
@@ -46,7 +48,7 @@ impl Embedding {
         )?;
         weight.set_requires_grad(true);
 
-        Ok(Self { weight, vocab_size, dim, runtime: runtime.clone() })
+        Ok(Self { weight, vocab_size, dim, runtime: runtime.clone(), cached_table: std::sync::RwLock::new(None) })
     }
 
     /// Forward: gather rows by token IDs.
@@ -68,7 +70,19 @@ impl Embedding {
         use super::super::tape::Tape;
         use super::super::tensor::DType;
 
-        let table = self.weight.to_f32_vec();
+        // Use cached weight table if available, otherwise read from GPU and cache
+        let table = {
+            let cached = self.cached_table.read().unwrap();
+            if let Some(ref t) = *cached {
+                t.clone()
+            } else {
+                drop(cached);
+                let t = self.weight.to_f32_vec();
+                let mut cached = self.cached_table.write().unwrap();
+                *cached = Some(t.clone());
+                t
+            }
+        };
         let seq_len = ids.len();
         let mut out = vec![0f32; seq_len * self.dim];
         for (i, &id) in ids.iter().enumerate() {

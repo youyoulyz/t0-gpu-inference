@@ -97,6 +97,24 @@ pub fn matmul(x: &Tensor, w: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor
     Ok(output)
 }
 
+/// Pre-compute bf16 transposed weight buffer [N, K] from f32 weight [K, N].
+///
+/// Call once during initialization, cache the result, and pass to
+/// `matmul_with_wt_bf16` for fast repeated forwards.
+#[cfg(feature = "rocm")]
+pub fn precompute_wt_bf16(
+    runtime: &Arc<GpuRuntime>,
+    w_f32: &GpuBuffer,
+    k: usize,
+    n: usize,
+) -> Result<GpuBuffer, String> {
+    use crate::t0::gemm_gen::GemmConfig;
+    let cfg = select_config(1); // M=1 for inference
+    let n_pad = pad_tile(n, cfg.tile_n);
+    let k_pad = pad_tile(k, cfg.tile_k);
+    f32_to_bf16_transpose_gpu_padded(runtime, w_f32, k, n, n_pad, k_pad)
+}
+
 /// MatMul with pre-transposed bf16 weight (for inference/repeated forward).
 #[cfg(feature = "rocm")]
 pub fn matmul_with_wt_bf16(
