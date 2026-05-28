@@ -1077,7 +1077,96 @@ mod kv_cache_tests {
         cache.append(&r, 0, &key, &val).unwrap();
     }
 
-    // ── Test 12: remaining capacity tracking ──
+    // ── Test 12: read_k_layer / read_v_layer ──
+
+    #[test]
+    fn test_kv_cache_read_layers() {
+        let r = rt();
+        let cfg = small_config();
+        let cache = KvCache::new(&r, cfg.clone()).unwrap();
+
+        let head_elements = cfg.num_kv_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+
+        // Prefill 3 tokens with distinct data
+        for s in 0..3 {
+            let k_data: Vec<f32> = (0..head_elements).map(|i| (s * 100 + i) as f32).collect();
+            let v_data: Vec<f32> = (0..head_elements).map(|i| (s * 200 + i) as f32).collect();
+            let key = Tensor::from_f32(&r, &k_data, &[cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+            let val = Tensor::from_f32(&r, &v_data, &[cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+            cache.append(&r, 0, &key, &val).unwrap();
+            cache.advance();
+        }
+
+        // read_k_layer should return all 3 tokens' K data
+        let k_all = cache.read_k_layer(&r, 0);
+        assert_eq!(k_all.len(), 3 * kv_dim, "k_all len mismatch");
+
+        // Verify each token's K data
+        for s in 0..3 {
+            for i in 0..head_elements {
+                let expected = (s * 100 + i) as f32;
+                let got = k_all[s * kv_dim + i];
+                assert!((got - expected).abs() < 1e-5,
+                    "read_k_layer[{}][{}]: got {} expected {}", s, i, got, expected);
+            }
+        }
+
+        // read_v_layer should return all 3 tokens' V data
+        let v_all = cache.read_v_layer(&r, 0);
+        assert_eq!(v_all.len(), 3 * kv_dim);
+
+        for s in 0..3 {
+            for i in 0..head_elements {
+                let expected = (s * 200 + i) as f32;
+                let got = v_all[s * kv_dim + i];
+                assert!((got - expected).abs() < 1e-5,
+                    "read_v_layer[{}][{}]: got {} expected {}", s, i, got, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_kv_cache_read_layers_multiple_layers() {
+        let r = rt();
+        let cfg = small_config(); // 2 layers
+        let cache = KvCache::new(&r, cfg.clone()).unwrap();
+
+        let head_elements = cfg.num_kv_heads * cfg.head_dim;
+
+        // Write different data to each layer
+        for layer in 0..cfg.num_layers {
+            let k_data: Vec<f32> = (0..head_elements).map(|i| (layer * 1000 + i) as f32).collect();
+            let v_data: Vec<f32> = (0..head_elements).map(|i| (layer * 2000 + i) as f32).collect();
+            let key = Tensor::from_f32(&r, &k_data, &[cfg.num_kv_heads, cfg.head_dim], "k").unwrap();
+            let val = Tensor::from_f32(&r, &v_data, &[cfg.num_kv_heads, cfg.head_dim], "v").unwrap();
+            cache.append(&r, layer, &key, &val).unwrap();
+        }
+        cache.advance();
+
+        // Each layer should return its own data
+        for layer in 0..cfg.num_layers {
+            let k_all = cache.read_k_layer(&r, layer);
+            for i in 0..head_elements {
+                let expected = (layer * 1000 + i) as f32;
+                assert!((k_all[i] - expected).abs() < 1e-5,
+                    "layer {} K[{}]: got {} expected {}", layer, i, k_all[i], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_kv_cache_read_layers_empty() {
+        let r = rt();
+        let cfg = small_config();
+        let cache = KvCache::new(&r, cfg.clone()).unwrap();
+
+        // Position=0 → empty read
+        let k_all = cache.read_k_layer(&r, 0);
+        assert_eq!(k_all.len(), 0, "empty cache should return empty vec");
+    }
+
+    // ── Test 13: remaining capacity tracking ──
 
     #[test]
     fn test_kv_cache_remaining() {

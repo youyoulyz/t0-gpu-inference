@@ -266,8 +266,8 @@ impl TransformerLayer {
         // K/V shape from qk_norm: [seq, kv_dim]. Reshape to [seq, kv_heads, head_dim] for cache.
         let kv_heads = self.n_kv_heads;
         let hd = self.d_head;
-        let k_3d = k.reshape(&[seq_len, kv_heads, hd])?;
-        let v_3d = v.reshape(&[seq_len, kv_heads, hd])?;
+        let k_3d = k.reshape(&[seq_len, kv_heads, hd]);
+        let v_3d = v.reshape(&[seq_len, kv_heads, hd]);
 
         if seq_len == 1 {
             kv_cache.append(&self.runtime, layer_idx, &k_3d, &v_3d)?;

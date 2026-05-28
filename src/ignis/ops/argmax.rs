@@ -187,3 +187,184 @@ pub fn sample_token(
     // Fallback: return last non-zero token
     Ok((vocab_size - 1) as u32)
 }
+
+/// CPU reference: greedy argmax over logits (for testing).
+pub fn cpu_argmax(logits: &[f32]) -> usize {
+    logits.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// CPU reference: sample a token from logits with temperature and top-p (for testing).
+///
+/// Returns (token_id, probs_vector) for verification.
+pub fn cpu_sample_token(logits: &[f32], temperature: f32, top_p: f32, rand_val: f32) -> (usize, Vec<f32>) {
+    let vocab_size = logits.len();
+
+    // Greedy
+    if temperature <= 0.0 || top_p <= 0.0 {
+        return (cpu_argmax(logits), vec![]);
+    }
+
+    // Temperature scaling + softmax
+    let inv_temp = 1.0 / temperature;
+    let mut scaled: Vec<f32> = logits.iter().map(|&l| l * inv_temp).collect();
+    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for v in scaled.iter_mut() {
+        *v = (*v - max_val).exp();
+    }
+    let sum: f32 = scaled.iter().sum();
+    for v in scaled.iter_mut() {
+        *v /= sum;
+    }
+
+    // Top-p filtering
+    if top_p < 1.0 {
+        let mut indexed: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut cumsum = 0.0f32;
+        let mut cutoff_idx = indexed.len();
+        for (i, (_, p)) in indexed.iter().enumerate() {
+            cumsum += p;
+            if cumsum >= top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+
+        let mut keep = vec![false; vocab_size];
+        for &(idx, _) in &indexed[..cutoff_idx] {
+            keep[idx] = true;
+        }
+        let mut sum_kept = 0.0f32;
+        for i in 0..vocab_size {
+            if !keep[i] {
+                scaled[i] = 0.0;
+            }
+            sum_kept += scaled[i];
+        }
+        if sum_kept > 0.0 {
+            for v in scaled.iter_mut() {
+                *v /= sum_kept;
+            }
+        }
+    }
+
+    // Sample using provided rand_val
+    let mut cumsum = 0.0f32;
+    for (i, &p) in scaled.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= rand_val {
+            return (i, scaled);
+        }
+    }
+    (vocab_size - 1, scaled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpu_argmax_basic() {
+        assert_eq!(cpu_argmax(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(cpu_argmax(&[5.0, 1.0, 2.0]), 0);
+        assert_eq!(cpu_argmax(&[1.0, 2.0, 5.0]), 2);
+    }
+
+    #[test]
+    fn test_cpu_argmax_tie() {
+        // With equal values, max_by returns the last one
+        assert_eq!(cpu_argmax(&[3.0, 3.0, 1.0]), 1);
+    }
+
+    #[test]
+    fn test_cpu_argmax_single() {
+        assert_eq!(cpu_argmax(&[42.0]), 0);
+    }
+
+    #[test]
+    fn test_cpu_sample_greedy() {
+        let logits = vec![0.1, 0.5, 0.3, 0.2];
+        // temperature <= 0 → greedy
+        let (tok, _) = cpu_sample_token(&logits, 0.0, 1.0, 0.5);
+        assert_eq!(tok, 1); // argmax
+    }
+
+    #[test]
+    fn test_cpu_sample_greedy_top_p_zero() {
+        let logits = vec![0.1, 0.5, 0.3, 0.2];
+        let (tok, _) = cpu_sample_token(&logits, 1.0, 0.0, 0.5);
+        assert_eq!(tok, 1); // greedy when top_p <= 0
+    }
+
+    #[test]
+    fn test_cpu_sample_temperature_scales() {
+        // With high temperature, distribution should be more uniform
+        let logits = vec![10.0, 0.0, 0.0, 0.0];
+
+        // Low temperature → peaked at index 0
+        let (_, probs_low) = cpu_sample_token(&logits, 0.1, 1.0, 0.5);
+        assert!(probs_low[0] > 0.99, "low temp: probs[0]={} should be >0.99", probs_low[0]);
+
+        // High temperature → more spread
+        let (_, probs_high) = cpu_sample_token(&logits, 100.0, 1.0, 0.5);
+        assert!(probs_high[0] < 0.5, "high temp: probs[0]={} should be <0.5", probs_high[0]);
+    }
+
+    #[test]
+    fn test_cpu_sample_top_p_filters() {
+        // With top_p=0.1, only the highest-prob token should survive
+        let logits = vec![5.0, 1.0, 1.0, 1.0];
+        let (_, probs) = cpu_sample_token(&logits, 1.0, 0.1, 0.5);
+
+        // Only index 0 should have nonzero probability
+        assert!(probs[0] > 0.99, "top_p filter: probs[0]={}", probs[0]);
+        assert!(probs[1] < 1e-6, "top_p filter: probs[1]={}", probs[1]);
+    }
+
+    #[test]
+    fn test_cpu_sample_rand_val_selects() {
+        // With rand_val very small, should select first token in sorted order
+        let logits = vec![0.0, 10.0, 0.0, 0.0];
+        let (tok, _) = cpu_sample_token(&logits, 1.0, 1.0, 0.001);
+        assert_eq!(tok, 1); // highest prob token
+    }
+
+    #[test]
+    fn test_cpu_sample_rand_val_large() {
+        // With rand_val very large (but < 1.0), should select last token
+        let logits = vec![0.0, 0.0, 0.0, 10.0];
+        let (tok, _) = cpu_sample_token(&logits, 1.0, 1.0, 0.999);
+        assert_eq!(tok, 3);
+    }
+
+    #[test]
+    fn test_cpu_sample_probs_sum_to_one() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let (_, probs) = cpu_sample_token(&logits, 1.0, 1.0, 0.5);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "probs sum={}", sum);
+    }
+
+    #[test]
+    fn test_cpu_sample_top_p_probs_sum_to_one() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let (_, probs) = cpu_sample_token(&logits, 1.0, 0.5, 0.5);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "top_p probs sum={}", sum);
+    }
+
+    #[test]
+    fn test_cpu_sample_uniform_logits() {
+        // All logits equal → uniform distribution
+        let logits = vec![1.0; 10];
+        let (_, probs) = cpu_sample_token(&logits, 1.0, 1.0, 0.5);
+        for (i, &p) in probs.iter().enumerate() {
+            assert!((p - 0.1).abs() < 1e-5, "uniform probs[{}]={}", i, p);
+        }
+    }
+}
