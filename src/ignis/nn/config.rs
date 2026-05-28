@@ -10,6 +10,8 @@ pub struct Qwen3Config {
     pub num_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    /// Explicit head dimension (Qwen3 uses 128, independent of hidden_size / num_heads).
+    pub head_dim: usize,
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
@@ -26,6 +28,7 @@ impl Qwen3Config {
             num_layers: 28,
             num_attention_heads: 16,
             num_key_value_heads: 8,
+            head_dim: 128,
             intermediate_size: 3072,
             vocab_size: 151936,
             max_position_embeddings: 40960,
@@ -42,6 +45,7 @@ impl Qwen3Config {
             num_layers: 36,
             num_attention_heads: 32,
             num_key_value_heads: 8,
+            head_dim: 128,
             intermediate_size: 12288,
             vocab_size: 151936,
             max_position_embeddings: 40960,
@@ -51,14 +55,19 @@ impl Qwen3Config {
         }
     }
 
-    /// Head dimension.
+    /// Head dimension (explicit from config, not derived).
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
     }
 
     /// K/V projection dimension: num_key_value_heads * head_dim.
     pub fn kv_dim(&self) -> usize {
-        self.num_key_value_heads * self.head_dim()
+        self.num_key_value_heads * self.head_dim
+    }
+
+    /// Q projection output dimension: num_attention_heads * head_dim.
+    pub fn q_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim
     }
 
     /// Load from a HuggingFace config.json file.
@@ -100,11 +109,16 @@ impl Qwen3Config {
             }
         };
 
+        let num_heads = get_usize("num_attention_heads")?;
+        let hidden = get_usize("hidden_size")?;
+        let head_dim = get_usize("head_dim").unwrap_or(hidden / num_heads);
+
         Ok(Self {
-            hidden_size: get_usize("hidden_size")?,
+            hidden_size: hidden,
             num_layers: get_usize("num_hidden_layers")?,
-            num_attention_heads: get_usize("num_attention_heads")?,
-            num_key_value_heads: get_usize("num_key_value_heads").unwrap_or(get_usize("num_attention_heads")?),
+            num_attention_heads: num_heads,
+            num_key_value_heads: get_usize("num_key_value_heads").unwrap_or(num_heads),
+            head_dim,
             intermediate_size: get_usize("intermediate_size")?,
             vocab_size: get_usize("vocab_size")?,
             max_position_embeddings: get_usize("max_position_embeddings").unwrap_or(40960),
@@ -116,20 +130,20 @@ impl Qwen3Config {
 
     /// Validate internal consistency.
     pub fn validate(&self) -> Result<(), String> {
-        if self.hidden_size % self.num_attention_heads != 0 {
-            return Err(format!(
-                "hidden_size ({}) must be divisible by num_attention_heads ({})",
-                self.hidden_size, self.num_attention_heads
-            ));
-        }
         if self.num_attention_heads % self.num_key_value_heads != 0 {
             return Err(format!(
                 "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
                 self.num_attention_heads, self.num_key_value_heads
             ));
         }
-        if self.head_dim() % 2 != 0 {
-            return Err(format!("head_dim ({}) must be even (for RoPE)", self.head_dim()));
+        if self.head_dim % 2 != 0 {
+            return Err(format!("head_dim ({}) must be even (for RoPE)", self.head_dim));
+        }
+        if self.head_dim > 256 {
+            return Err(format!(
+                "head_dim ({}) exceeds RoPE/RMSNorm kernel limit (256)",
+                self.head_dim
+            ));
         }
         Ok(())
     }
@@ -163,10 +177,11 @@ mod tests {
         assert_eq!(cfg.num_layers, 28);
         assert_eq!(cfg.num_attention_heads, 16);
         assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.head_dim(), 128);
         assert_eq!(cfg.intermediate_size, 3072);
         assert_eq!(cfg.vocab_size, 151936);
-        assert_eq!(cfg.head_dim(), 64);
-        assert_eq!(cfg.kv_dim(), 512);
+        assert_eq!(cfg.q_dim(), 2048);
+        assert_eq!(cfg.kv_dim(), 1024);
         cfg.validate().unwrap();
     }
 
@@ -177,9 +192,10 @@ mod tests {
         assert_eq!(cfg.num_layers, 36);
         assert_eq!(cfg.num_attention_heads, 32);
         assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.head_dim(), 128);
         assert_eq!(cfg.intermediate_size, 12288);
-        assert_eq!(cfg.head_dim(), 80);
-        assert_eq!(cfg.kv_dim(), 640);
+        assert_eq!(cfg.q_dim(), 4096);
+        assert_eq!(cfg.kv_dim(), 1024);
         cfg.validate().unwrap();
     }
 
@@ -190,6 +206,7 @@ mod tests {
             "num_hidden_layers": 28,
             "num_attention_heads": 16,
             "num_key_value_heads": 8,
+            "head_dim": 128,
             "intermediate_size": 3072,
             "vocab_size": 151936,
             "max_position_embeddings": 40960,
@@ -201,6 +218,9 @@ mod tests {
         assert_eq!(cfg.hidden_size, 1024);
         assert_eq!(cfg.num_layers, 28);
         assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.head_dim(), 128);
+        assert_eq!(cfg.q_dim(), 2048);
+        assert_eq!(cfg.kv_dim(), 1024);
         assert_eq!(cfg.vocab_size, 151936);
         assert!(cfg.tie_word_embeddings);
         cfg.validate().unwrap();
@@ -223,7 +243,7 @@ mod tests {
     #[test]
     fn test_validate_fails() {
         let mut cfg = Qwen3Config::qwen3_0_6b();
-        cfg.num_attention_heads = 7; // not divisible into hidden_size
+        cfg.num_attention_heads = 7; // not divisible into num_key_value_heads
         assert!(cfg.validate().is_err());
     }
 }

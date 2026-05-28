@@ -460,12 +460,50 @@ impl KvCache {
         offset_elements * 4
     }
 
+    // ── Read helpers for attention ──
+
+    /// Read K data for a layer into a flat f32 vector.
+    /// Returns [pos * kv_heads * head_dim] elements (all cached positions).
+    pub fn read_k_layer(&self, runtime: &Arc<GpuRuntime>, layer: usize) -> Vec<f32> {
+        let _ = runtime.wait_idle();
+        let pos = self.position.load(Ordering::Acquire) as usize;
+        let n = pos * self.config.num_kv_heads * self.config.head_dim;
+        let offset = self.k_offset(layer, 0);
+        let mut data = vec![0f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buf.host_ptr.add(offset) as *const f32,
+                data.as_mut_ptr(),
+                n,
+            );
+        }
+        data
+    }
+
+    /// Read V data for a layer into a flat f32 vector.
+    /// Returns [pos * kv_heads * head_dim] elements (all cached positions).
+    pub fn read_v_layer(&self, runtime: &Arc<GpuRuntime>, layer: usize) -> Vec<f32> {
+        let _ = runtime.wait_idle();
+        let pos = self.position.load(Ordering::Acquire) as usize;
+        let n = pos * self.config.num_kv_heads * self.config.head_dim;
+        let offset = self.v_offset(layer, 0);
+        let mut data = vec![0f32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buf.host_ptr.add(offset) as *const f32,
+                data.as_mut_ptr(),
+                n,
+            );
+        }
+        data
+    }
+
     // ── Debug helpers ──
 
     /// Read back the entire KV cache to CPU (for testing).
     /// WARNING: very slow for large caches — use only for debugging.
     pub fn to_cpu_vec(&self, runtime: &Arc<GpuRuntime>) -> Vec<f32> {
-        let _ = runtime.queue.synchronize();
+        let _ = runtime.wait_idle();
         let n = self.config.total_elements();
         let mut data = vec![0f32; n];
         self.buf.read(unsafe {

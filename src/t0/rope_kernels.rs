@@ -25,13 +25,13 @@ const WG_SIZE: u32 = 128;
 
 /// Build RoPE forward kernel.
 ///
-/// Kernarg layout: [x:u64, out:u64, pos_ptr:u64, d_model:u32, inv_freq_base:f32]
+/// Kernarg layout: [x:u64, out:u64, d_model:u32, n_tokens:u32, pos_base:u32]
 ///
 /// - x: (n_tokens × d_model) f32 — input embeddings
 /// - out: (n_tokens × d_model) f32 — output (rotated)
-/// - pos_ptr: (n_tokens,) u32 — position index per token
 /// - d_model: embedding dimension (must be even, ≤ WG_SIZE*2)
-/// - inv_freq_base: base for frequency (default: 10000.0)
+/// - n_tokens: number of tokens
+/// - pos_base: starting position offset (0 for prefill, current_pos for decode)
 ///
 /// Grid: (n_tokens * WG_SIZE, 1, 1)
 pub fn build_rope_forward() -> BlockKernel {
@@ -40,7 +40,8 @@ pub fn build_rope_forward() -> BlockKernel {
     let x_ptr = kb.arg_ptr("x");
     let out_ptr = kb.arg_ptr("out");
     let d_model = kb.arg_u32("d_model");
-    let n_tokens = kb.arg_u32("n_tokens");
+    let _n_tokens = kb.arg_u32("n_tokens");
+    let pos_base = kb.arg_u32("pos_base");
 
     let tid = kb.thread_id();     // pair index within row (0..d_model/2-1)
     let pid = kb.program_id(0);   // token index
@@ -93,8 +94,9 @@ pub fn build_rope_forward() -> BlockKernel {
     // Step 3: freq = exp(log_freq)
     let freq = log_freq.exp(&mut kb);
 
-    // Step 4: theta = pos * freq (pos is just the row index = pid)
-    let pos_f = pid.to_f32(&mut kb);
+    // Step 4: theta = (pos_base + pid) * freq
+    let pos = pos_base.add(&mut kb, pid);
+    let pos_f = pos.to_f32(&mut kb);
     let theta = pos_f.mul(&mut kb, freq);
 
     // Step 5: cos(θ) and sin(θ)
@@ -127,14 +129,15 @@ pub fn build_rope_forward() -> BlockKernel {
 /// dx_odd  = -dout_even * sin(θ) + dout_odd * cos(θ)
 /// ```
 ///
-/// Kernarg layout: same as forward (dout replaces x, dx replaces out)
+/// Kernarg layout: [dout:u64, dx:u64, d_model:u32, n_tokens:u32, pos_base:u32]
 pub fn build_rope_backward() -> BlockKernel {
     let mut kb = BlockKernel::new("rope_bwd", WG_SIZE);
 
     let dout_ptr = kb.arg_ptr("dout");
     let dx_ptr = kb.arg_ptr("dx");
     let d_model = kb.arg_u32("d_model");
-    let n_tokens = kb.arg_u32("n_tokens");
+    let _n_tokens = kb.arg_u32("n_tokens");
+    let pos_base = kb.arg_u32("pos_base");
 
     let tid = kb.thread_id();
     let pid = kb.program_id(0);
@@ -162,7 +165,8 @@ pub fn build_rope_backward() -> BlockKernel {
     let neg_ln_base = kb.const_f32(-9.21034);
     let log_freq = ratio.mul(&mut kb, neg_ln_base);
     let freq = log_freq.exp(&mut kb);
-    let pos_f = pid.to_f32(&mut kb);
+    let pos = pos_base.add(&mut kb, pid);
+    let pos_f = pos.to_f32(&mut kb);
     let theta = pos_f.mul(&mut kb, freq);
     let cos_theta = theta.cos(&mut kb);
     let sin_theta = theta.sin(&mut kb);
@@ -307,7 +311,8 @@ mod tests {
             x_buf.gpu_addr() => u64,
             out_buf.gpu_addr() => u64,
             d_model => u32,
-            n_tokens => u32
+            n_tokens => u32,
+            0u32 => u32  // pos_base
         ];
         let (grid_x, _) = rope_grid(n_tokens);
         rt.dispatch(&kernel, [grid_x, 1, 1], &ka).expect("dispatch");

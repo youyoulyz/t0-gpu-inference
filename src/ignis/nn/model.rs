@@ -77,6 +77,7 @@ impl LanguageModel {
             num_layers: n_layers,
             num_attention_heads: n_heads,
             num_key_value_heads: n_heads,
+            head_dim: dim / n_heads,
             intermediate_size: dim * ffn_mult,
             vocab_size,
             max_position_embeddings: 40960,

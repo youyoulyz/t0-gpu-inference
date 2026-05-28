@@ -420,6 +420,14 @@ pub fn load_qwen3_into_model(
             layer.ffn_norm_gamma = w.clone();
         }
 
+        // QK-norm weights (Qwen3-specific)
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
+            layer.q_norm_gamma = w.clone();
+        }
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
+            layer.k_norm_gamma = w.clone();
+        }
+
         eprintln!("[Safetensors] Assigned layer {}", layer_idx);
     }
 
@@ -545,6 +553,8 @@ pub fn qwen3_weight_map(safetensors_name: &str) -> Option<String> {
                     "self_attn.k_proj.weight" => format!("layers.{}.attn.k_proj.weight", layer_idx),
                     "self_attn.v_proj.weight" => format!("layers.{}.attn.v_proj.weight", layer_idx),
                     "self_attn.o_proj.weight" => format!("layers.{}.attn.o_proj.weight", layer_idx),
+                    "self_attn.q_norm.weight" => format!("layers.{}.attn.q_norm.weight", layer_idx),
+                    "self_attn.k_norm.weight" => format!("layers.{}.attn.k_norm.weight", layer_idx),
                     "mlp.gate_proj.weight" => format!("layers.{}.ffn.gate_proj.weight", layer_idx),
                     "mlp.up_proj.weight" => format!("layers.{}.ffn.up_proj.weight", layer_idx),
                     "mlp.down_proj.weight" => format!("layers.{}.ffn.down_proj.weight", layer_idx),

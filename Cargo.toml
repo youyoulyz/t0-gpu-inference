@@ -14,7 +14,7 @@ default = []
 rocm = []  # Enable KFD runtime (requires /dev/kfd)
 
 [dependencies]
-# No external dependencies — pure Rust
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [[bin]]
 name = "isa_probe"

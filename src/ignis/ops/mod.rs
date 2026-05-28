@@ -17,3 +17,6 @@ pub mod gemm_autotune;
 pub mod fusion;
 pub mod argmax;
 pub mod softmax;
+pub mod rope;
+pub mod qk_norm;
+pub mod attention;
