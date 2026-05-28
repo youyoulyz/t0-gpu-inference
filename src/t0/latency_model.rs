@@ -156,6 +156,8 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
         Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
         Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } |
+        Op::VCmpLtF32 { .. } | Op::VCmpGeF32 { .. } |
+        Op::VCmpEqU32 { .. } | Op::VCmpGtU32 { .. } |
         Op::VReadfirstlane { .. } => valu_simple(),
 
         // ── VALU complex: 2-cycle (mul, fma, integer mul, cvt, VOP3) ──

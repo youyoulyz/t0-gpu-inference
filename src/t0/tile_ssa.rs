@@ -408,6 +408,8 @@ pub enum TileOp {
     ThreadIdX2D { result: Value, block_x: u32 },
     /// 2D workgroup thread Y index: flat_tid >> log2(block_x)
     ThreadIdY2D { result: Value, block_x: u32 },
+    /// Simple thread X index (0..wg_size) for elementwise-1d kernels
+    ThreadIdX { result: Value },
 
     // ── Shape 操作 ──
     /// 标量广播为向量/tile
@@ -727,6 +729,13 @@ impl TileFunc {
     pub fn program_id(&mut self, axis: u8) -> Value {
         let v = self.alloc_value(TileType::scalar_u32(), None);
         self.push_op(TileOp::ProgramId { result: v, axis });
+        v
+    }
+
+    /// 获取线程 X ID（0..wg_size），用于 elementwise-1d 内核
+    pub fn thread_id_x(&mut self) -> Value {
+        let v = self.alloc_value(TileType::scalar_u32(), None);
+        self.push_op(TileOp::ThreadIdX { result: v });
         v
     }
 
@@ -1467,6 +1476,8 @@ impl TileFunc {
                 format!("{}: [{}]U32 = thread_id_x_2d(bx={})", result, block_x, block_x),
             TileOp::ThreadIdY2D { result, block_x } =>
                 format!("{}: U32 = thread_id_y_2d(bx={})", result, block_x),
+            TileOp::ThreadIdX { result } =>
+                format!("{}: U32 = thread_id_x()", result),
             TileOp::Splat { result, src, shape } =>
                 format!("{}: {} = splat({}, {:?})", result, self.values[result.0 as usize].ty, src, shape),
             TileOp::Load { result, ptr, indices, mask, .. } => {
@@ -1624,6 +1635,7 @@ fn op_result(op: &TileOp) -> Option<Value> {
         TileOp::ConstU32 { result, .. } | TileOp::ConstF32 { result, .. } |
         TileOp::ProgramId { result, .. } | TileOp::Arange { result, .. } |
         TileOp::ThreadIdX2D { result, .. } | TileOp::ThreadIdY2D { result, .. } |
+        TileOp::ThreadIdX { result, .. } |
         TileOp::Splat { result, .. } | TileOp::Reshape { result, .. } |
         TileOp::ExpandDims { result, .. } |
         TileOp::Load { result, .. } |

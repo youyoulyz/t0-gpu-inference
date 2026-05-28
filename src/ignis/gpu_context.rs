@@ -247,6 +247,32 @@ impl GpuRuntime {
         Ok(kernel_arc)
     }
 
+    /// Load a pre-compiled kernel from ELF bytes and cache it.
+    /// Used for kernels compiled via TileSSA directly (not BlockDSL).
+    ///
+    /// The `builder` closure returns `(elf_bytes, workgroup_size, lds_size)`.
+    pub fn ensure_kernel_precompiled<F>(
+        &self,
+        name: &str,
+        builder: F,
+    ) -> Result<Arc<GpuKernel>, String>
+    where F: FnOnce() -> Result<(Vec<u8>, [u32; 3], u32), String> {
+        let mut cache = self.kernel_cache.lock().unwrap();
+        if let Some(k) = cache.get(name) {
+            return Ok(k.clone());
+        }
+
+        let (elf, wg_size, lds_size) = builder()?;
+        let config = KernelLoadConfig {
+            workgroup_size: wg_size,
+            lds_size,
+        };
+        let kernel = GpuKernel::load(&self.device, &elf, &config)?;
+        let kernel_arc = Arc::new(kernel);
+        cache.insert(name.to_string(), kernel_arc.clone());
+        Ok(kernel_arc)
+    }
+
     // ── Dispatch helpers ──
 
     /// Allocate a kernarg slot and return its index.

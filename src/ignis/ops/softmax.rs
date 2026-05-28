@@ -7,8 +7,6 @@
 //! Supports cols > 256 (up to 65536+).
 
 #[cfg(feature = "rocm")]
-use crate::kfd::GpuBuffer;
-#[cfg(feature = "rocm")]
 use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
 use super::super::gpu_context::GpuRuntime;
@@ -86,8 +84,10 @@ fn softmax_large(
 
     let output_buf = runtime.alloc_f32(batch * n)?;
 
-    let k_softmax = runtime.ensure_kernel_blockdsl("softmax_large", || {
-        crate::t0::softmax_large::build_softmax_large()
+    // Use TileSSA-based kernel with vector accumulators
+    let k_softmax = runtime.ensure_kernel_precompiled("softmax_large", || {
+        let ck = crate::t0::softmax_large::compile_softmax_large()?;
+        Ok((ck.elf, ck.workgroup_size, ck.lds_size))
     })?;
 
     let (grid_x, _) = crate::t0::softmax_large::softmax_large_grid(batch as u32);

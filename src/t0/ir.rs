@@ -381,6 +381,10 @@ pub enum Op {
 
     /// v_cmp_ge_u32 vcc, src0, src1 — set VCC where src0 >= src1 (unsigned)
     VCmpGeU32 { src0: Operand, src1: Operand },
+
+    /// v_cmp_gt_u32 vcc, src0, src1 — set VCC where src0 > src1 (unsigned)
+    VCmpGtU32 { src0: Operand, src1: Operand },
+
     /// v_cmp_eq_f32 vcc, src0, src1 — set VCC where src0 == src1
     VCmpEqF32 { src0: Operand, src1: Operand },
     /// v_cmp_gt_f32 vcc, src0, src1 — set VCC where src0 > src1
@@ -388,6 +392,15 @@ pub enum Op {
 
     /// v_cmp_gt_f32 vcc, src, 0.0 — set VCC where src > 0.0 (for ReLU mask)
     VCmpGtF32Imm0 { src: VReg },
+
+    /// v_cmp_lt_f32 vcc, src0, src1 — set VCC where src0 < src1
+    VCmpLtF32 { src0: Operand, src1: Operand },
+
+    /// v_cmp_ge_f32 vcc, src0, src1 — set VCC where src0 >= src1
+    VCmpGeF32 { src0: Operand, src1: Operand },
+
+    /// v_cmp_eq_u32 vcc, src0, src1 — set VCC where src0 == src1
+    VCmpEqU32 { src0: Operand, src1: Operand },
 
     /// v_cndmask_b32 dst, src0, src1, vcc — dst = VCC ? src1 : src0
     VCndmaskB32 { dst: VReg, src_false: Operand, src_true: Operand },
@@ -634,8 +647,12 @@ impl Op {
             // Comparisons
             Op::VCmpLtU32 { src0, src1 } |
             Op::VCmpGeU32 { src0, src1 } |
+            Op::VCmpGtU32 { src0, src1 } |
             Op::VCmpEqF32 { src0, src1 } |
-            Op::VCmpGtF32 { src0, src1 } => {
+            Op::VCmpGtF32 { src0, src1 } |
+            Op::VCmpLtF32 { src0, src1 } |
+            Op::VCmpGeF32 { src0, src1 } |
+            Op::VCmpEqU32 { src0, src1 } => {
                 let mut v = vec![];
                 v.extend(operand_vregs(src0));
                 v.extend(operand_vregs(src1));
@@ -874,8 +891,12 @@ impl Op {
             // ── Comparisons ──
             Op::VCmpLtU32 { src0, src1 } |
             Op::VCmpGeU32 { src0, src1 } |
+            Op::VCmpGtU32 { src0, src1 } |
             Op::VCmpEqF32 { src0, src1 } |
-            Op::VCmpGtF32 { src0, src1 } => {
+            Op::VCmpGtF32 { src0, src1 } |
+            Op::VCmpLtF32 { src0, src1 } |
+            Op::VCmpGeF32 { src0, src1 } |
+            Op::VCmpEqU32 { src0, src1 } => {
                 let mut v = vec![];
                 v.extend(operand_vregs(src0));
                 v.extend(operand_vregs(src1));

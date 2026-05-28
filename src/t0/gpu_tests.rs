@@ -339,4 +339,73 @@ mod t0_gpu_tests {
             }
         });
     }
+
+    // ═══════════════════════════════════════════
+    //  Large-row softmax (chunked) GPU tests
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn test_gpu_softmax_large() {
+        with_rt(|rt| {
+            for &(rows, cols) in &[
+                (2usize, 257usize),     // just over limit
+                (4, 512),               // 2 chunks
+                (1, 1024),              // 4 chunks
+                (2, 4096),              // 16 chunks
+                (1, 8192),              // 32 chunks
+            ] {
+                let data: Vec<f32> = (0..rows * cols).map(|i| {
+                    ((i as f32) * 0.013 - 3.0).sin() * 5.0
+                }).collect();
+
+                let x_buf = rt.upload_f32(&data).unwrap();
+                let out_buf = rt.alloc_f32(rows * cols).unwrap();
+
+                let n_chunks = crate::t0::softmax_large::softmax_n_chunks(cols as u32);
+                let kernel = rt.ensure_kernel_precompiled("softmax_large", || {
+                    let ck = crate::t0::softmax_large::compile_softmax_large()?;
+                    Ok((ck.elf, ck.workgroup_size, ck.lds_size))
+                }).unwrap();
+
+                let (grid_x, _) = crate::t0::softmax_large::softmax_large_grid(rows as u32);
+                let ka = crate::kernargs![
+                    x_buf.gpu_addr() => u64,
+                    out_buf.gpu_addr() => u64,
+                    cols as u32 => u32,
+                    n_chunks => u32
+                ];
+                rt.dispatch(&kernel, [grid_x, 1, 1], &ka).unwrap();
+
+                let result = rt.read_f32(&out_buf, rows * cols);
+
+                // CPU reference softmax
+                let mut max_err = 0f32;
+                for r in 0..rows {
+                    let row = &data[r * cols..(r + 1) * cols];
+                    let row_max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let exp_vals: Vec<f32> = row.iter().map(|&x| (x - row_max).exp()).collect();
+                    let exp_sum: f32 = exp_vals.iter().sum();
+                    for c in 0..cols {
+                        let expected = exp_vals[c] / exp_sum;
+                        let got = result[r * cols + c];
+                        let err = (got - expected).abs();
+                        max_err = max_err.max(err);
+                        assert!(
+                            err < 1e-3,
+                            "softmax_large mismatch at [{},{}]: expected {:.6e}, got {:.6e} ({}x{})",
+                            r, c, expected, got, rows, cols,
+                        );
+                    }
+                    let row_sum: f32 = result[r * cols..(r + 1) * cols].iter().sum();
+                    assert!(
+                        (row_sum - 1.0).abs() < 1e-3,
+                        "softmax_large row {} sum = {:.6} (expected 1.0), {}x{}",
+                        r, row_sum, rows, cols,
+                    );
+                }
+                eprintln!("[PASS] test_gpu_softmax_large: {}x{} ({} chunks) verified (max_err={:.6e})",
+                    rows, cols, n_chunks, max_err);
+            }
+        });
+    }
 }

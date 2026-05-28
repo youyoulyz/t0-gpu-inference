@@ -153,6 +153,10 @@ enum MachineVal {
 pub fn lower_elementwise_1d(func: &TileFunc, wg_size: u32, epl: u32) -> Result<LoweredKernel, String> {
     let mut k = T0Kernel::new(&func.name);
     k.set_wg_size(wg_size);
+    // Disable optimizer for elementwise kernels — LICM incorrectly moves
+    // loop body ops to preheader, causing wrong address computation.
+    // TODO: fix LICM to respect loop boundaries.
+    k.skip_optimize = true;
 
     // ── Step 1: 声明 kernargs（与 SSA args 一一对应）──
     let mut val_map: HashMap<Value, MachineVal> = HashMap::new();
@@ -194,11 +198,18 @@ pub fn lower_elementwise_1d(func: &TileFunc, wg_size: u32, epl: u32) -> Result<L
         for &param in &block.params {
             let ty = &func.all_values()[param.0 as usize].ty;
             match ty {
-                TileType::Scalar(ScalarDType::U32) | TileType::Scalar(ScalarDType::I32)
-                | TileType::Scalar(ScalarDType::F32) => {
+                TileType::Scalar(ScalarDType::U32) | TileType::Scalar(ScalarDType::I32) => {
                     let sr = k.alloc_sreg();
                     val_map.insert(param, MachineVal::SReg(sr));
                     block_param_original.insert(param, MachineVal::SReg(sr));
+                }
+                // CRITICAL: Use VReg for F32 scalar block params (e.g., loop accumulators).
+                // SReg round-trip via v_readfirstlane corrupts per-thread data by only
+                // reading lane 0's value. VReg block params avoid this entirely.
+                TileType::Scalar(ScalarDType::F32) => {
+                    let vr = k.alloc_vreg();
+                    val_map.insert(param, MachineVal::VReg(vr));
+                    block_param_original.insert(param, MachineVal::VReg(vr));
                 }
                 TileType::Vector { .. } => {
                     let vr = k.alloc_vreg();
@@ -406,6 +417,14 @@ fn lower_tile_op(
             val_map.insert(*result, MachineVal::SReg(s));
         }
 
+        TileOp::ThreadIdX { result } => {
+            // Simple thread X ID (0..wg_size) for elementwise-1d kernels.
+            // In wave32, lane_id = tid & 31; for wg_size=256 we need the full WG-relative ID.
+            // The lowering for elementwise-1d sets WG size = 256, so tid 0..255 maps to lanes.
+            let tid = k.thread_id_x();  // v0 = WORKITEM_ID_X (flat, 0..255 within WG)
+            val_map.insert(*result, MachineVal::VReg(tid));
+        }
+
         TileOp::Arange { result, start, len } => {
             // arange(start, len) 生成 per-lane 索引: [start, start+1, ..., start+len-1]
             // 在 wave32 中, 每个 lane 的 index = thread_id_x + start
@@ -475,10 +494,9 @@ fn lower_tile_op(
             };
             let bytes_per_elem = dtype.bytes();
 
-            let dst_v = k.alloc_vreg();
-            k.v_mov_imm(dst_v, 0); // zero-init for masked-out lanes
-
             // 计算 byte address: ptr + indices * bytes_per_elem
+            // CRITICAL: compute address BEFORE allocating dst_v to avoid regalloc
+            // reusing the index VReg for dst_v (which would zero-init and corrupt it).
             let idx_v = get_vreg(k, val_map, *indices)?;
             let byte_off = k.alloc_vreg();
             match bytes_per_elem {
@@ -499,6 +517,10 @@ fn lower_tile_op(
             k.clear_vcc();
             k.v_add_co(addr, addr, byte_off);
             k.v_add_co_ci(VReg(addr.0 + 1), VReg(addr.0 + 1));
+
+            // NOW allocate dst_v (after address computation is done)
+            let dst_v = k.alloc_vreg();
+            k.v_mov_imm(dst_v, 0); // zero-init for masked-out lanes
 
             // 如果有 mask，用 EXEC mask 保护
             let saved_exec = if let Some(mask_val) = mask {
@@ -911,11 +933,38 @@ fn lower_tile_op(
                 // 向量比较 → VCC
                 let lv = get_vreg(k, val_map, *lhs)?;
                 let rv = get_vreg(k, val_map, *rhs)?;
+                // Check operand type to choose correct comparison
+                let lhs_ty = func.value_type(*lhs);
+                let is_float = lhs_ty.dtype().map(|d| d.is_float()).unwrap_or(false);
                 match cmp_op {
-                    CmpOpKind::Lt => k.v_cmp_lt_u32(Operand::VReg(lv), Operand::VReg(rv)),
-                    CmpOpKind::Ge => k.v_cmp_ge_u32(Operand::VReg(lv), Operand::VReg(rv)),
-                    CmpOpKind::Eq => k.v_cmp_eq_f32(lv, rv),
-                    CmpOpKind::Gt => k.v_cmp_gt_f32(lv, rv),
+                    CmpOpKind::Lt => {
+                        if is_float {
+                            k.v_cmp_lt_f32(Operand::VReg(lv), Operand::VReg(rv));
+                        } else {
+                            k.v_cmp_lt_u32(Operand::VReg(lv), Operand::VReg(rv));
+                        }
+                    }
+                    CmpOpKind::Ge => {
+                        if is_float {
+                            k.v_cmp_ge_f32(Operand::VReg(lv), Operand::VReg(rv));
+                        } else {
+                            k.v_cmp_ge_u32(Operand::VReg(lv), Operand::VReg(rv));
+                        }
+                    }
+                    CmpOpKind::Eq => {
+                        if is_float {
+                            k.v_cmp_eq_f32(lv, rv);
+                        } else {
+                            k.v_cmp_eq_u32(Operand::VReg(lv), Operand::VReg(rv));
+                        }
+                    }
+                    CmpOpKind::Gt => {
+                        if is_float {
+                            k.v_cmp_gt_f32(lv, rv);
+                        } else {
+                            k.v_cmp_gt_u32(Operand::VReg(lv), Operand::VReg(rv));
+                        }
+                    }
                     _ => return Err(format!("Unimplemented cmp: {:?}", cmp_op)),
                 }
                 // 物化 VCC boolean 到 VGPR: dst = VCC ? 1 : 0
@@ -1123,7 +1172,22 @@ fn lower_tile_op(
             // Step 6: wave reduce partial sums
             let tmp2 = k.alloc_vreg();
             k.wave_reduce_add_f32(partial, tmp2);
-            val_map.insert(*result, MachineVal::VReg(partial));
+
+            // CRITICAL: Broadcast result to all lanes.
+            // After wave_reduce_add_f32, only lane 0 has the correct global value.
+            let global_sgpr = k.alloc_sreg();
+            k.v_cmp_eq_u32_imm(lane_id, 0);
+            let saved3 = k.alloc_sreg();
+            k.save_exec(saved3);
+            k.v_readfirstlane(global_sgpr, partial);
+            k.restore_exec(saved3);
+            // CRITICAL: v_mov_from_sgpr only writes to active lanes.
+            // After restore_exec, only lane 0 is active (from save_exec above).
+            // Set EXEC to all 1s to broadcast to all lanes.
+            k.push(Op::RawAsm("s_mov_b32 exec_lo, -1".to_string()));
+            let broadcast_v = k.alloc_vreg();
+            k.v_mov_from_sgpr(broadcast_v, global_sgpr);
+            val_map.insert(*result, MachineVal::VReg(broadcast_v));
         }
 
         TileOp::WgReduceMax { result, src, block_size } => {
@@ -1184,7 +1248,20 @@ fn lower_tile_op(
             // Step 6: wave reduce max on partial
             let tmp2 = k.alloc_vreg();
             k.wave_reduce_max_f32(partial, tmp2);
-            val_map.insert(*result, MachineVal::VReg(partial));
+
+            // CRITICAL: Broadcast result to all lanes.
+            // After wave_reduce_max_f32, only lane 0 has the correct global value.
+            let global_sgpr = k.alloc_sreg();
+            k.v_cmp_eq_u32_imm(lane_id, 0);
+            let saved3 = k.alloc_sreg();
+            k.save_exec(saved3);
+            k.v_readfirstlane(global_sgpr, partial);
+            k.restore_exec(saved3);
+            // Set EXEC to all 1s to broadcast to all lanes.
+            k.push(Op::RawAsm("s_mov_b32 exec_lo, -1".to_string()));
+            let broadcast_v = k.alloc_vreg();
+            k.v_mov_from_sgpr(broadcast_v, global_sgpr);
+            val_map.insert(*result, MachineVal::VReg(broadcast_v));
         }
 
         TileOp::WgReduceMin { result, src, block_size } => {
@@ -1245,7 +1322,20 @@ fn lower_tile_op(
             // Step 6: wave reduce min on partial
             let tmp2 = k.alloc_vreg();
             k.wave_reduce_min_f32(partial, tmp2);
-            val_map.insert(*result, MachineVal::VReg(partial));
+
+            // CRITICAL: Broadcast result to all lanes.
+            // After wave_reduce_min_f32, only lane 0 has the correct global value.
+            let global_sgpr = k.alloc_sreg();
+            k.v_cmp_eq_u32_imm(lane_id, 0);
+            let saved3 = k.alloc_sreg();
+            k.save_exec(saved3);
+            k.v_readfirstlane(global_sgpr, partial);
+            k.restore_exec(saved3);
+            // Set EXEC to all 1s to broadcast to all lanes.
+            k.push(Op::RawAsm("s_mov_b32 exec_lo, -1".to_string()));
+            let broadcast_v = k.alloc_vreg();
+            k.v_mov_from_sgpr(broadcast_v, global_sgpr);
+            val_map.insert(*result, MachineVal::VReg(broadcast_v));
         }
 
         // ── EXEC Mask（条件执行）──
@@ -1345,7 +1435,9 @@ fn copy_machine_val(
             // VReg→SReg: use v_readfirstlane to move lane 0 value to SGPR.
             // This is correct for scalar loop IVs that were promoted to VReg
             // by get_vreg() caching — all lanes have the same value.
-            k.push(Op::RawAsm(format!("v_readfirstlane_b32 s{}, v{}", d.0, s.0)));
+            // CRITICAL: use Op::VReadfirstlane (not RawAsm) so the SGPR allocator
+            // maps the virtual SReg to the correct physical register.
+            k.v_readfirstlane(*d, *s);
         }
         (MachineVal::InlineInt(v), MachineVal::VReg(d)) => {
             k.v_mov_imm(*d, *v);

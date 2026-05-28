@@ -817,6 +817,12 @@ impl AsmEmitter {
                 writeln!(self.buf, "{}v_cmp_ge_u32 vcc_lo, {}, {}",
                     self.indent, s0, s1).unwrap();
             }
+            Op::VCmpGtU32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_gt_u32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
+            }
             Op::VCmpEqF32 { src0, src1 } => {
                 let s0 = operand_str(src0, a);
                 let s1 = operand_str(src1, a);
@@ -833,6 +839,24 @@ impl AsmEmitter {
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}v_cmp_gt_f32 vcc_lo, v{}, 0",
                     self.indent, vs).unwrap();
+            }
+            Op::VCmpLtF32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_lt_f32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
+            }
+            Op::VCmpGeF32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_ge_f32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
+            }
+            Op::VCmpEqU32 { src0, src1 } => {
+                let s0 = operand_str(src0, a);
+                let s1 = operand_str(src1, a);
+                writeln!(self.buf, "{}v_cmp_eq_u32 vcc_lo, {}, {}",
+                    self.indent, s0, s1).unwrap();
             }
             Op::VCndmaskB32 { dst, src_false, src_true } => {
                 let vd = a.phys_v(*dst);

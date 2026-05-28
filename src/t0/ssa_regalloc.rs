@@ -294,18 +294,38 @@ pub fn allocate_ssa(
     func: &MachFunc,
     max_vgprs: u8,
 ) -> SsaRegAlloc {
-    // ── SGPR allocation (bump, same as legacy) ──
+    // ── SGPR allocation (bump, with overlap protection) ──
     let mut sgpr_map: HashMap<SReg, u8> = HashMap::new();
+    let mut used_phys: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let mut next_sgpr: u8 = 5; // s0:s1 = kernarg, s2/s3/s4 = TGID
+
+    // Reserve kernel argument SGPRs: s5, s6, s7, s8, s9, s10, s11
+    // emit_arg_loads hardcodes these physical SGPRs for kernel args.
+    // We must not reuse them for scratch!
+    for phys in 5..=11u8 {
+        used_phys.insert(phys);
+    }
 
     for sa in sreg_allocs {
         if sa.count == 1 {
+            // Find first unused physical SGPR
+            while used_phys.contains(&next_sgpr) {
+                next_sgpr += 1;
+            }
             sgpr_map.insert(sa.sreg, next_sgpr);
+            used_phys.insert(next_sgpr);
             next_sgpr += 1;
         } else if sa.count == 2 {
+            // Find first aligned pair where both are unused
+            while used_phys.contains(&((next_sgpr + 1) & !1)) ||
+                  used_phys.contains(&(((next_sgpr + 1) & !1) + 1)) {
+                next_sgpr += 2;
+            }
             let aligned = (next_sgpr + 1) & !1;
             sgpr_map.insert(sa.sreg, aligned);
             sgpr_map.insert(SReg(sa.sreg.0 + 1), aligned + 1);
+            used_phys.insert(aligned);
+            used_phys.insert(aligned + 1);
             next_sgpr = aligned + 2;
         } else if sa.count == 4 {
             // Buffer resource descriptors need 4-aligned SGPRs

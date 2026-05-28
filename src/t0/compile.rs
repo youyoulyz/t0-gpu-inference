@@ -38,7 +38,7 @@ pub struct T0Kernel {
     wgp_mode: bool,
     label_counter: u32,
     /// Skip optimization passes (for hardware probes that need exact instruction ordering)
-    skip_optimize: bool,
+    pub skip_optimize: bool,
     /// Use SSA-based register allocator (Phase E) instead of legacy linear scan
     use_ssa_regalloc: bool,
     /// Optimization level override (0-4). None = use default (4) or env var.
@@ -643,6 +643,21 @@ impl T0Kernel {
         self.ops.push(Op::VCmpGtF32 { src0: Operand::VReg(src0), src1: Operand::VReg(src1) });
     }
 
+    /// v_cmp_lt_f32: set VCC where src0 < src1
+    pub fn v_cmp_lt_f32(&mut self, src0: Operand, src1: Operand) {
+        self.ops.push(Op::VCmpLtF32 { src0, src1 });
+    }
+
+    /// v_cmp_ge_f32: set VCC where src0 >= src1
+    pub fn v_cmp_ge_f32(&mut self, src0: Operand, src1: Operand) {
+        self.ops.push(Op::VCmpGeF32 { src0, src1 });
+    }
+
+    /// v_cmp_eq_u32: set VCC where src0 == src1
+    pub fn v_cmp_eq_u32(&mut self, src0: Operand, src1: Operand) {
+        self.ops.push(Op::VCmpEqU32 { src0, src1 });
+    }
+
     /// v_cmp_gt_f32 vcc, src, 0 — set VCC where src > 0.0 (ReLU mask)
     pub fn v_cmp_gt_f32_imm0(&mut self, src: VReg) {
         self.ops.push(Op::VCmpGtF32Imm0 { src });
@@ -725,6 +740,11 @@ impl T0Kernel {
     /// v_cmp_gt_u32 vcc, src, imm
     pub fn v_cmp_gt_u32_imm(&mut self, src: VReg, imm: u32) {
         self.ops.push(Op::VCmpGtU32Imm { src, imm });
+    }
+
+    /// v_cmp_gt_u32 vcc, src0, src1
+    pub fn v_cmp_gt_u32(&mut self, src0: Operand, src1: Operand) {
+        self.ops.push(Op::VCmpGtU32 { src0, src1 });
     }
 
     /// v_cmp_ge_i32 vcc, src0, src1

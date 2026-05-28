@@ -1603,7 +1603,12 @@ fn rename_op_uses(op: &mut Op, old: VReg, new: VReg) {
             if *src == old { *src = new; }
         }
         // Comparisons (Operand based)
-        Op::VCmpLtU32 { src0, src1 } | Op::VCmpGeU32 { src0, src1 } => {
+        Op::VCmpLtU32 { src0, src1 } |
+        Op::VCmpGeU32 { src0, src1 } |
+        Op::VCmpGtU32 { src0, src1 } |
+        Op::VCmpEqU32 { src0, src1 } |
+        Op::VCmpLtF32 { src0, src1 } |
+        Op::VCmpGeF32 { src0, src1 } => {
             rename_operand(src0, old, new);
             rename_operand(src1, old, new);
         }

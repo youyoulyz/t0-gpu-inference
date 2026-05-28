@@ -182,7 +182,9 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::VCmpGtF32Imm0 { .. } |
         Op::VCmpGtU32Imm { .. } | Op::VCmpEqU32Imm { .. } |
         Op::VCmpGeI32 { .. } |
-        Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } => InsnLatency::valu(),
+        Op::VCmpEqF32 { .. } | Op::VCmpGtF32 { .. } |
+        Op::VCmpLtF32 { .. } | Op::VCmpGeF32 { .. } |
+        Op::VCmpEqU32 { .. } | Op::VCmpGtU32 { .. } => InsnLatency::valu(),
 
         // ── Control flow ──
         Op::Label(_) | Op::Branch(_) | Op::BranchScc1(_) |
