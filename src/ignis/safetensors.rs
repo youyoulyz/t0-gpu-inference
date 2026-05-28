@@ -429,14 +429,78 @@ pub fn load_qwen3_into_model(
         eprintln!("[Safetensors] Assigned model.norm.weight");
     }
 
-    // LM head
+    // LM head — either from file or tied to embedding
     if let Some(w) = all_tensors.get("lm_head.weight") {
         model.lm_head.weight = w.clone();
         eprintln!("[Safetensors] Assigned lm_head.weight");
+    } else if model.config.tie_word_embeddings {
+        // Weight tying: lm_head shares embedding weight
+        model.tie_lm_head();
+        eprintln!("[Safetensors] Tied lm_head.weight → embedding.weight");
     }
 
     eprintln!("[Safetensors] Model weight loading complete!");
     Ok(())
+}
+
+/// Discover safetensors files in a model directory.
+///
+/// Returns paths sorted by filename (handles sharded models like
+/// `model-00001-of-00003.safetensors`).
+pub fn discover_safetensors_files(dir: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let dir_path = std::path::Path::new(dir);
+    if !dir_path.is_dir() {
+        return Err(format!("{} is not a directory", dir));
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(dir_path)
+        .map_err(|e| format!("read_dir {}: {}", dir, e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir entry: {}", e))?;
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "safetensors") {
+            files.push(path);
+        }
+    }
+
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .safetensors files found in {}", dir));
+    }
+
+    eprintln!("[Safetensors] Found {} safetensors file(s) in {}", files.len(), dir);
+    Ok(files)
+}
+
+/// Load Qwen3 model from a directory path.
+///
+/// 1. Reads config.json from the directory
+/// 2. Discovers all .safetensors files
+/// 3. Constructs LanguageModel from config
+/// 4. Loads weights into the model
+pub fn load_qwen3_model_from_dir(
+    runtime: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
+    dir: &str,
+) -> Result<crate::ignis::nn::model::LanguageModel, String> {
+    use crate::ignis::nn::config::Qwen3Config;
+
+    let config = Qwen3Config::from_file(dir)?;
+    eprintln!("[Safetensors] Model config: {} layers, {} hidden, {} heads ({} kv), vocab {}",
+        config.num_layers, config.hidden_size, config.num_attention_heads,
+        config.num_key_value_heads, config.vocab_size);
+
+    let mut model = crate::ignis::nn::model::LanguageModel::from_config(runtime, &config)?;
+    let paths = discover_safetensors_files(dir)?;
+    load_qwen3_into_model(runtime, &paths, &mut model)?;
+
+    // Tie weights if needed (after loading, so embedding.weight is the real one)
+    if config.tie_word_embeddings {
+        model.tie_lm_head();
+    }
+
+    Ok(model)
 }
 
 /// Qwen3 weight name mapping: safetensors name → Ignis layer path.
@@ -683,5 +747,32 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_qwen3_weight_map_all_keys() {
+        // Verify all expected Qwen3 weight names map correctly
+        let expected = vec![
+            ("model.embed_tokens.weight", "embedding.weight"),
+            ("model.layers.0.input_layernorm.weight", "layers.0.attn_norm.weight"),
+            ("model.layers.0.post_attention_layernorm.weight", "layers.0.ffn_norm.weight"),
+            ("model.layers.0.self_attn.q_proj.weight", "layers.0.attn.q_proj.weight"),
+            ("model.layers.0.self_attn.k_proj.weight", "layers.0.attn.k_proj.weight"),
+            ("model.layers.0.self_attn.v_proj.weight", "layers.0.attn.v_proj.weight"),
+            ("model.layers.0.self_attn.o_proj.weight", "layers.0.attn.o_proj.weight"),
+            ("model.layers.0.mlp.gate_proj.weight", "layers.0.ffn.gate_proj.weight"),
+            ("model.layers.0.mlp.up_proj.weight", "layers.0.ffn.up_proj.weight"),
+            ("model.layers.0.mlp.down_proj.weight", "layers.0.ffn.down_proj.weight"),
+            ("model.norm.weight", "final_norm.weight"),
+            ("lm_head.weight", "lm_head.weight"),
+        ];
+        for (st_name, expected_path) in expected {
+            assert_eq!(
+                qwen3_weight_map(st_name),
+                Some(expected_path.to_string()),
+                "mapping failed for {}",
+                st_name
+            );
+        }
     }
 }

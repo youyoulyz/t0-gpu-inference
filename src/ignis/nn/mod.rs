@@ -3,6 +3,7 @@
 #[cfg(feature = "rocm")]
 use super::tensor::Tensor;
 
+pub mod config;
 pub mod linear;
 pub mod embedding;
 pub mod transformer;
