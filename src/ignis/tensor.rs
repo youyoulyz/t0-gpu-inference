@@ -133,6 +133,31 @@ impl Tensor {
         })
     }
 
+    /// Create a non-owning tensor view from a raw GPU virtual address.
+    ///
+    /// The resulting Tensor does NOT own the underlying memory — it will not
+    /// be freed when the Tensor is dropped (handle=0 signals this to GpuBuffer).
+    /// Useful for wrapping sub-regions of pre-allocated buffers (e.g. KV cache).
+    pub fn from_gpu_addr(
+        gpu_addr: u64,
+        runtime: &Arc<GpuRuntime>,
+        shape: &[usize],
+        label: &str,
+    ) -> Self {
+        let buf = crate::kfd::GpuBuffer::new_view(gpu_addr, runtime.device.clone());
+        Tensor {
+            id: next_tensor_id(),
+            buf: Arc::new(buf),
+            runtime: runtime.clone(),
+            shape: shape.to_vec(),
+            dtype: DType::F32,
+            label: label.to_string(),
+            grad: RefCell::new(None),
+            tape_node: Cell::new(None),
+            requires_grad: false,
+        }
+    }
+
     // ── Autodiff control ──
 
     /// Mark this tensor as requiring gradients. Returns self for chaining.

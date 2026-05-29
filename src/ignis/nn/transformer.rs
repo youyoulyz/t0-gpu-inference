@@ -245,23 +245,19 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
-        eprintln!("  [L{}] rmsnorm_attn", layer_idx);
 
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
 
-        eprintln!("  [L{}] qkv_proj", layer_idx);
         // Q/K/V projections
         let q = self.wq.forward(&h)?;  // [seq, q_dim]
         let k = self.wk.forward(&h)?;  // [seq, kv_dim]
         let v = self.wv.forward(&h)?;  // [seq, kv_dim]
 
-        eprintln!("  [L{}] qk_norm", layer_idx);
         // QK-norm: per-head RMSNorm on Q and K
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
 
-        eprintln!("  [L{}] rope", layer_idx);
         // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
         let q_2d = q.reshape(&[seq_len * self.n_heads, self.d_head]);
         let k_2d = k.reshape(&[seq_len * self.n_kv_heads, self.d_head]);
@@ -270,7 +266,6 @@ impl TransformerLayer {
         let q = q_2d.reshape(&[seq_len, self.q_dim]);
         let k = k_2d.reshape(&[seq_len, self.kv_dim]);
 
-        eprintln!("  [L{}] kv_cache", layer_idx);
         // Store K/V in cache
         let kv_heads = self.n_kv_heads;
         let hd = self.d_head;
@@ -285,14 +280,12 @@ impl TransformerLayer {
             kv_cache.advance_by(seq_len);
         }
 
-        eprintln!("  [L{}] attention", layer_idx);
-        // Read full K/V history from cache into CPU tensors
+        // Zero-copy: create Tensors directly from KV cache GPU addresses
         let kv_len = kv_cache.position();
-        let k_data = kv_cache.read_k_layer(&self.runtime, layer_idx);
-        let v_data = kv_cache.read_v_layer(&self.runtime, layer_idx);
-
-        let k_cache = Tensor::from_f32(&self.runtime, &k_data, &[kv_len, self.kv_dim], "k_cache")?;
-        let v_cache = Tensor::from_f32(&self.runtime, &v_data, &[kv_len, self.kv_dim], "v_cache")?;
+        let k_slice = kv_cache.get_k(layer_idx);
+        let v_slice = kv_cache.get_v(layer_idx);
+        let k_cache = Tensor::from_gpu_addr(k_slice.gpu_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
+        let v_cache = Tensor::from_gpu_addr(v_slice.gpu_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
 
         // Standard scaled dot-product attention with GQA
         let attn_out = ops::attention::standard_attention(
@@ -301,7 +294,6 @@ impl TransformerLayer {
             &self.runtime,
         )?;
 
-        eprintln!("  [L{}] o_proj + residual", layer_idx);
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
         let x2 = ops::add::add(x, &proj_out, device)?;

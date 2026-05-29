@@ -610,5 +610,67 @@ mod tests {
             eprintln!("GPU vs CPU max error: {:.6}", max_err);
             assert!(max_err < 1.0, "GPU vs CPU max error too large: {}", max_err);
         }
+
+        #[test]
+        fn test_gpu_attention_zerocopy_kv_cache() {
+            // Verify that using from_gpu_addr (KV cache zero-copy) produces
+            // identical results to using from_f32 (CPU upload path).
+            use crate::ignis::kv_cache::{KvCache, KvCacheConfig};
+
+            let r = rt();
+            let head_dim = 8;
+            let n_heads = 2;
+            let n_kv_heads = 2;
+            let seq_len = 1; // decode
+            let kv_len = 5;  // 5 tokens already cached
+
+            let cfg = KvCacheConfig {
+                num_layers: 1,
+                num_kv_heads: n_kv_heads,
+                head_dim,
+                max_seq_len: 32,
+            };
+            let cache = KvCache::new(&r, cfg).unwrap();
+
+            // Fill cache with 5 tokens
+            let kv_dim = n_kv_heads * head_dim;
+            for pos in 0..kv_len {
+                let k_data: Vec<f32> = (0..kv_dim).map(|i| (pos * 100 + i) as f32 * 0.01).collect();
+                let v_data: Vec<f32> = (0..kv_dim).map(|i| (pos * 100 + i) as f32 * 0.02).collect();
+                let key = Tensor::from_f32(&r, &k_data, &[n_kv_heads, head_dim], "k").unwrap();
+                let val = Tensor::from_f32(&r, &v_data, &[n_kv_heads, head_dim], "v").unwrap();
+                cache.append(&r, 0, &key, &val).unwrap();
+                cache.advance();
+            }
+
+            // Q: random
+            let q_data: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i as f32) * 0.1).sin()).collect();
+            let q = Tensor::from_f32(&r, &q_data, &[seq_len, n_heads * head_dim], "q").unwrap();
+
+            // Path A: old way — CPU read + re-upload
+            let k_cpu_data = cache.read_k_layer(&r, 0);
+            let v_cpu_data = cache.read_v_layer(&r, 0);
+            let k_old = Tensor::from_f32(&r, &k_cpu_data, &[kv_len, kv_dim], "k_old").unwrap();
+            let v_old = Tensor::from_f32(&r, &v_cpu_data, &[kv_len, kv_dim], "v_old").unwrap();
+            let out_old = standard_attention(&q, &k_old, &v_old, n_heads, n_kv_heads, head_dim, &r).unwrap();
+
+            // Path B: zero-copy — from_gpu_addr
+            let k_slice = cache.get_k(0);
+            let v_slice = cache.get_v(0);
+            let k_new = Tensor::from_gpu_addr(k_slice.gpu_addr, &r, &[kv_len, kv_dim], "k_new");
+            let v_new = Tensor::from_gpu_addr(v_slice.gpu_addr, &r, &[kv_len, kv_dim], "v_new");
+            let out_new = standard_attention(&q, &k_new, &v_new, n_heads, n_kv_heads, head_dim, &r).unwrap();
+
+            let old_data = out_old.to_f32_vec();
+            let new_data = out_new.to_f32_vec();
+
+            let mut max_err: f32 = 0.0;
+            for i in 0..n_heads * head_dim {
+                let err = (old_data[i] - new_data[i]).abs();
+                max_err = max_err.max(err);
+            }
+            eprintln!("Zero-copy vs CPU-upload max error: {:.8}", max_err);
+            assert!(max_err < 1e-5, "Zero-copy mismatch: max_err={}", max_err);
+        }
     }
 }
