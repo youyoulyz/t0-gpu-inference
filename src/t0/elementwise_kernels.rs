@@ -364,6 +364,34 @@ pub fn build_bf16_store_test() -> BlockKernel {
     kb
 }
 
+/// f32 → bf16 conversion using store_b32 (bypasses store_bf16).
+/// Each thread converts one f32 to bf16 and stores it as u32 at dst[offset].
+/// The bf16 value is in the lower 16 bits of the u32.
+///
+/// Kernarg layout: [src:u64, dst:u64, n:u32]
+/// Grid: ((n + WG_SIZE - 1) / WG_SIZE * WG_SIZE, 1)
+pub fn build_f32_to_bf16_b32() -> BlockKernel {
+    let mut kb = BlockKernel::new("f32_to_bf16_b32", WG_SIZE);
+
+    let src = kb.arg_ptr("src");
+    let dst = kb.arg_ptr("dst");
+    let n = kb.arg_u32("n");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+    let wg_size = kb.const_u32(WG_SIZE);
+    let offset = pid.mul(&mut kb, wg_size).add(&mut kb, tid);
+    let in_bounds = offset.lt(&mut kb, n);
+
+    let val = kb.load(src, offset, in_bounds);
+    // f32 → bf16: shift right 16 (truncation)
+    let bf16_val = val.shr(&mut kb, 16);
+    // Store as b32 (bf16 in lower 16 bits)
+    kb.store(dst, offset, bf16_val, in_bounds);
+
+    kb
+}
+
 /// f32 → bf16 conversion with per-row padding.
 ///
 /// Converts f32 [real_rows, real_cols] → bf16 [pad_rows, pad_cols].
@@ -608,7 +636,6 @@ mod tests {
         let n: u32 = 64;
         let f32_data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
         let src_buf = rt.upload_f32(&f32_data).unwrap();
-        // bf16 output: n elements × 2 bytes
         let dst_buf = rt.alloc(((n as usize * 2) + 255) & !255).unwrap();
         dst_buf.zero();
 
@@ -622,11 +649,11 @@ mod tests {
         ];
         rt.dispatch(&kernel, [grid, 1, 1], &ka).expect("dispatch");
 
-        // Also test the padded kernel with multiple workgroups
-        let rows: u32 = 16;
-        let cols: u32 = 8;
-        let pad_cols: u32 = 16;
-        let f32_data2: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.05).collect();
+        // Test padded kernel with large dimensions (like FFN weights)
+        let rows: u32 = 16;  // pad_rows
+        let cols: u32 = 3072; // real_cols (FFN intermediate size)
+        let pad_cols: u32 = 3072;
+        let f32_data2: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.001).collect();
         let src_buf2 = rt.upload_f32(&f32_data2).unwrap();
         let dst_buf2 = rt.alloc(((rows * pad_cols * 2) as usize + 255) & !255).unwrap();
         dst_buf2.zero();
@@ -639,7 +666,21 @@ mod tests {
             cols => u32,
             pad_cols => u32
         ];
-        rt.dispatch(&kernel2, [grid2, 1, 1], &ka2).expect("padded dispatch");
+        rt.dispatch(&kernel2, [grid2, 1, 1], &ka2).expect("padded dispatch large");
+
+        // Test: run GEMM first, then padded kernel (to reproduce inference hang)
+        use crate::ignis::ops::bf16_matmul;
+        let gm = 1usize;
+        let gk = 128usize;
+        let gn = 128usize;
+        let x_data: Vec<f32> = (0..gm * gk).map(|i| (i as f32) * 0.01).collect();
+        let w_data: Vec<f32> = (0..gk * gn).map(|i| (i as f32) * 0.02).collect();
+        let x_buf = rt.upload_f32(&x_data).unwrap();
+        let w_buf = rt.upload_f32(&w_data).unwrap();
+        let _ = bf16_matmul::gemm_f32_raw(&rt, &x_buf, &w_buf, gm, gk, gn).expect("gemm");
+
+        // Now run padded kernel again after GEMM
+        rt.dispatch(&kernel2, [grid2, 1, 1], &ka2).expect("padded dispatch after gemm");
 
         // Read back bf16 data and verify against CPU conversion
         // Note: GPU uses truncation (shift right 16), CPU uses round-to-nearest-even.
