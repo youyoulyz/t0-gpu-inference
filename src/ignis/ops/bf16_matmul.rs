@@ -440,3 +440,90 @@ fn f32_to_bf16_transpose_gpu_padded(
 
     Ok(dst)
 }
+
+#[cfg(all(test, feature = "rocm"))]
+mod gemm_debug_tests {
+    use super::*;
+    use std::sync::{Arc, OnceLock};
+    use crate::ignis::gpu_context::GpuRuntime;
+    use crate::ignis::tensor::Tensor;
+
+    struct SyncRt(Arc<GpuRuntime>);
+    unsafe impl Sync for SyncRt {}
+    unsafe impl Send for SyncRt {}
+    static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+
+    fn rt() -> Arc<GpuRuntime> {
+        GPU_RT.get_or_init(|| {
+            SyncRt(GpuRuntime::new().expect("GPU runtime"))
+        }).0.clone()
+    }
+
+    #[test]
+    fn test_gemm_m3_debug() {
+        let r = rt();
+        // X = [3, 4], W = [4, 3] → Y = [3, 3]
+        let x_data: Vec<f32> = (0..12).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let w_data: Vec<f32> = (0..12).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        let x = Tensor::from_f32(&r, &x_data, &[3, 4], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[4, 3], "w").unwrap();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; 9];
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut sum = 0.0f32;
+                for k in 0..4 {
+                    sum += x_data[i * 4 + k] * w_data[k * 3 + j];
+                }
+                expected[i * 3 + j] = sum;
+            }
+        }
+
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+
+        eprintln!("X: {:?}", x_data);
+        eprintln!("W: {:?}", w_data);
+        eprintln!("GPU Y: {:?}", y_data);
+        eprintln!("CPU Y: {:?}", expected);
+
+        for i in 0..9 {
+            let err = (y_data[i] - expected[i]).abs();
+            eprintln!("[{}] GPU={:.4} CPU={:.4} err={:.6}", i, y_data[i], expected[i], err);
+            assert!(err < 0.01, "[{}] GPU={} CPU={} err={}", i, y_data[i], expected[i], err);
+        }
+    }
+
+    #[test]
+    fn test_gemm_m1_works() {
+        let r = rt();
+        // X = [1, 4], W = [4, 3] → Y = [1, 3]
+        let x_data: Vec<f32> = (0..4).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let w_data: Vec<f32> = (0..12).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        let x = Tensor::from_f32(&r, &x_data, &[1, 4], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[4, 3], "w").unwrap();
+
+        let mut expected = vec![0.0f32; 3];
+        for j in 0..3 {
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                sum += x_data[k] * w_data[k * 3 + j];
+            }
+            expected[j] = sum;
+        }
+
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+
+        eprintln!("M=1 GPU: {:?}", y_data);
+        eprintln!("M=1 CPU: {:?}", expected);
+
+        for i in 0..3 {
+            let err = (y_data[i] - expected[i]).abs();
+            assert!(err < 0.01, "[{}] GPU={} CPU={} err={}", i, y_data[i], expected[i], err);
+        }
+    }
+}
