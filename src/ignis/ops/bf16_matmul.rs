@@ -151,6 +151,20 @@ pub fn matmul_with_wt_bf16(
     Ok(Tensor::from_buffer(Arc::new(y_buf), runtime, &[m, n], DType::F32, "matmul_wt_out"))
 }
 
+/// Raw f32 GEMM using bf16 WMMA pipeline (for attention and other inference ops).
+///
+/// Computes Y[M,N] = A[M,K] @ B[K,N] on GPU. All buffers are f32 GpuBuffers.
+/// Internally converts to bf16, dispatches WMMA kernel, returns f32 output.
+#[cfg(feature = "rocm")]
+pub fn gemm_f32_raw(
+    runtime: &Arc<GpuRuntime>,
+    a_f32: &GpuBuffer,  // [M, K]
+    b_f32: &GpuBuffer,  // [K, N]
+    m: usize, k: usize, n: usize,
+) -> Result<GpuBuffer, String> {
+    dispatch_gemm_forward(runtime, a_f32, b_f32, m, k, n)
+}
+
 // ── Config selection and padding ──
 
 /// Select tile config based on M dimension

@@ -51,6 +51,7 @@ pub mod adamw_kernels;
 pub mod elementwise_kernels;
 pub mod argmax_kernels;
 pub mod softmax_large;
+pub mod attention_kernels;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]

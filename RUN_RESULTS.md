@@ -9,21 +9,24 @@
 | 内核 | 6.x (amdgpu KFD 内置驱动) |
 | Rust | 1.94.0 |
 | LLVM | 17.0.6 |
-| Resizable BAR | ❌ 未启用 (Small BAR 系统) |
+| Resizable BAR | ✅ 已启用 (BAR size 32G, lspci 可确认) |
 
-## 关键修复 / Key Fix: Small BAR 支持
+## Small BAR 兼容性 / Small BAR Fallback
 
-这台机器**没有启用 Resizable BAR / Above 4G Decoding**，导致 KFD 无法分配 host-visible VRAM（`PUBLIC` 标志）。内核日志显示：
+这台机器实际已启用 Resizable BAR（BAR size 32G），但早期曾遇到 KFD 报错：
 ```
 amdgpu: Alloc host visible vram on small bar is not allowed
 ```
+该错误由特定 allocation flag 组合触发，并非系统为 Small BAR。为兼容 Small BAR 系统，添加了 fallback 逻辑：
 
-### 修复内容
+### 实现
 
 修改了 `src/kfd/mod.rs` 中的 `alloc_vram()` 和 `alloc_code()` 方法，添加了 small BAR 回退路径：
 - `alloc_vram()`: PUBLIC VRAM 失败 → 回退到 non-public VRAM
 - `alloc_code()`: PUBLIC VRAM 失败 → 回退到 non-public VRAM + EXECUTABLE
 - 新增 `alloc_vram_host()`: 专用于需要 CPU 读回的缓冲区
+
+在 ReBAR 系统上，PUBLIC 分配直接成功，fallback 不会触发；在 Small BAR 系统上，自动降级到 non-public 模式。
 
 ### 修改的文件
 - `src/kfd/mod.rs` — 添加 small BAR fallback 逻辑
@@ -86,7 +89,7 @@ T0_DUMP_ASM=1 cargo test --release --features rocm -- \
 ## 注意事项 / Notes
 
 1. **GPU 热节流**: 长时间运行后性能可能下降 1-3%，建议跑 2-3 次取最佳值
-2. **Small BAR**: 本机未启用 Resizable BAR，所有 VRAM 分配自动回退到 non-public 模式
+2. **Small BAR fallback**: 本机已启用 ReBAR（32G BAR），PUBLIC 分配正常工作；Small BAR 兼容逻辑作为 fallback 存在
 3. **8192³ hang**: 大矩阵全谱扫描时可能因热节流导致 GPU hang，属于散热限制而非软件问题
 4. **LLVM 17**: 已通过 `sudo apt install llvm-17 lld-17` 安装，符号链接到 `/usr/local/bin/`
 
