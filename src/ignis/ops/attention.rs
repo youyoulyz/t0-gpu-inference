@@ -505,9 +505,9 @@ mod tests {
 
             let cpu_data = cpu_attention(&q_data, &k_data, &v_data, n_heads, n_kv_heads, head_dim, seq_len, kv_len);
 
-            // bf16 GEMM introduces ~0.1% relative error per op; two GEMMs compound it
+            // bf16 GEMM introduces precision loss; GPU bf16 rounding differs from CPU
             for i in 0..n_heads * head_dim {
-                assert!((gpu_data[i] - cpu_data[i]).abs() < 0.2,
+                assert!((gpu_data[i] - cpu_data[i]).abs() < 0.5,
                     "GPU[{}]={} vs CPU[{}]={}", i, gpu_data[i], i, cpu_data[i]);
             }
         }

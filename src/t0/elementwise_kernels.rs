@@ -339,6 +339,79 @@ pub fn build_memcpy_kv_x16() -> BlockKernel {
     kb
 }
 
+// ── BF16 conversion kernels ──
+
+/// f32 → bf16 conversion with per-row padding.
+///
+/// Converts f32 [real_rows, real_cols] → bf16 [pad_rows, pad_cols].
+/// Out-of-bounds positions are zero-filled (bf16 0x0000).
+///
+/// Kernarg layout: [src:u64, dst:u64, real_cols:u32, pad_cols:u32]
+/// Grid: (pad_rows * WG_SIZE, 1)
+pub fn build_f32_to_bf16_padded() -> BlockKernel {
+    let mut kb = BlockKernel::new("f32_to_bf16_pad", WG_SIZE);
+
+    let src = kb.arg_ptr("src");
+    let dst = kb.arg_ptr("dst");
+    let real_cols = kb.arg_u32("real_cols");
+    let pad_cols = kb.arg_u32("pad_cols");
+
+    let tid = kb.thread_id();
+    let row = kb.program_id(0);
+
+    let col = tid;
+    let in_bounds = col.lt(&mut kb, real_cols);
+
+    // src offset = row * real_cols + col
+    let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
+    // dst offset = row * pad_cols + col (f32 element offset for store_bf16)
+    let dst_off = row.mul(&mut kb, pad_cols).add(&mut kb, col);
+
+    let val = kb.load(src, src_off, in_bounds);
+    // Store bf16 only where in bounds (dst stays zero in padded area)
+    kb.store_bf16(dst, dst_off, val, in_bounds);
+
+    kb
+}
+
+/// f32 → bf16 transpose with per-row padding.
+///
+/// Converts f32 [real_rows, real_cols] → bf16 [pad_cols, pad_rows].
+/// Transposed layout: out[col * pad_rows + row] = in[row * real_cols + col].
+///
+/// Kernarg layout: [src:u64, dst:u64, real_cols:u32, pad_rows:u32]
+/// Grid: (real_rows * WG_SIZE, 1)
+pub fn build_f32_to_bf16_transpose_padded() -> BlockKernel {
+    let mut kb = BlockKernel::new("f32_to_bf16_tp", WG_SIZE);
+
+    let src = kb.arg_ptr("src");
+    let dst = kb.arg_ptr("dst");
+    let real_cols = kb.arg_u32("real_cols");
+    let pad_rows = kb.arg_u32("pad_rows");
+
+    let tid = kb.thread_id();
+    let row = kb.program_id(0);
+
+    let col = tid;
+    let in_bounds = col.lt(&mut kb, real_cols);
+
+    // src offset = row * real_cols + col
+    let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
+    // dst offset (transposed) = col * pad_rows + row
+    let dst_off = col.mul(&mut kb, pad_rows).add(&mut kb, row);
+
+    let val = kb.load(src, src_off, in_bounds);
+    // Store only if in bounds (dst positions outside real data stay zero)
+    kb.store_bf16(dst, dst_off, val, in_bounds);
+
+    kb
+}
+
+/// Grid for f32_to_bf16_padded: one workgroup per padded row.
+pub fn f32_to_bf16_grid(padded_rows: u32) -> u32 {
+    padded_rows * WG_SIZE
+}
+
 /// Compute grid for x16 elementwise kernels.
 pub fn elementwise_grid_x16(n_elems: u32) -> u32 {
     let elems_per_wg = WG_SIZE * 16;

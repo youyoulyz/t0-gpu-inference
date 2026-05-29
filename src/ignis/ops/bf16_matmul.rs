@@ -382,12 +382,8 @@ fn unpad_f32(
 
 // ── BF16 conversion helpers with padding ──
 
-/// Convert f32 → bf16 on CPU, with padded output buffer.
-/// Converts `n_real` elements from src GPU buffer, allocates bf16 buffer
-/// for `n_padded` elements (extra elements = 0).
 /// Convert f32 [rows, cols] → bf16 [rows_padded, cols_padded] with per-row padding.
-/// Each row is padded from `cols` to `cols_padded` with zero bf16 values.
-/// Extra rows (rows..rows_padded) are all zeros.
+/// CPU conversion path (GPU store_bf16 causes hang — needs investigation).
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -401,9 +397,8 @@ fn f32_to_bf16_gpu_padded(
         std::slice::from_raw_parts_mut(f32_data.as_mut_ptr() as *mut u8, n_real * 4)
     });
 
-    // Convert to bf16 with per-row padding
     let n_padded = rows_padded * cols_padded;
-    let mut bf16_data = vec![0u16; n_padded]; // zeros for padding
+    let mut bf16_data = vec![0u16; n_padded];
     for r in 0..rows {
         for c in 0..cols {
             let bits = f32_data[r * cols + c].to_bits();
@@ -417,38 +412,31 @@ fn f32_to_bf16_gpu_padded(
     dst.write(unsafe {
         std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, bf16_bytes)
     });
-
     Ok(dst)
 }
 
-/// Convert f32 → bf16, transposed: [rows, cols] → [cols_padded, rows_padded] bf16.
-/// Pads output to `cols_padded` rows and `rows_padded` columns.
-/// Padding values are zero (bf16 0x0000).
+/// Convert f32 [rows, cols] → bf16 [cols_padded, rows_padded] transposed with padding.
+/// CPU conversion path (GPU store_bf16 causes hang — needs investigation).
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_transpose_gpu_padded(
     runtime: &Arc<GpuRuntime>,
     src: &GpuBuffer,
-    rows: usize,           // original rows (becomes cols after transpose)
-    cols: usize,            // original cols (becomes rows after transpose)
-    cols_padded: usize,     // padded cols (= padded rows of transposed result)
-    rows_padded: usize,     // padded rows (= padded cols of transposed result = K dimension)
+    rows: usize, cols: usize,
+    cols_padded: usize, rows_padded: usize,
 ) -> Result<GpuBuffer, String> {
-    // CPU path: read f32, transpose, convert to bf16
     let n = rows * cols;
     let mut f32_data = vec![0f32; n];
     src.read(unsafe {
         std::slice::from_raw_parts_mut(f32_data.as_mut_ptr() as *mut u8, n * 4)
     });
 
-    // Transpose and convert to bf16, with padding on both dimensions
     let n_padded = cols_padded * rows_padded;
-    let mut bf16_data = vec![0u16; n_padded]; // zeros for padding
+    let mut bf16_data = vec![0u16; n_padded];
     for r in 0..rows {
         for c in 0..cols {
-            let val = f32_data[r * cols + c];
-            let bits = val.to_bits();
+            let bits = f32_data[r * cols + c].to_bits();
             let bf16 = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16;
-            bf16_data[c * rows_padded + r] = bf16; // transposed: [c, r] with stride=rows_padded
+            bf16_data[c * rows_padded + r] = bf16;
         }
     }
 
@@ -457,7 +445,6 @@ fn f32_to_bf16_transpose_gpu_padded(
     dst.write(unsafe {
         std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, n_padded * 2)
     });
-
     Ok(dst)
 }
 
