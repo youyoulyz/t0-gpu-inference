@@ -1,104 +1,230 @@
-# 示例
+# 示例 / Examples
 
-## 1. Hello GEMM — 最小 bf16 矩阵乘法
+所有示例需要 `--features rocm` 和 `/dev/kfd` 设备。GPU 测试必须单线程运行 (`--test-threads=1`)。
 
-```rust
-use t0::math::matmul_direct;
-use t0::schedule::GFX1100Schedule;
-use t0::ir::Target;
+All examples require `--features rocm` and `/dev/kfd`. GPU tests must use `--test-threads=1`.
 
-fn main() -> Result<(), String> {
-    // 编译 GEMM 内核
-    let hsaco = matmul_direct(&GFX1100Schedule)
-        .compile(Target::GFX1100)?;
+---
 
-    // 打开 GPU
-    let device = KfdDevice::open()?;
-    let queue = device.create_queue()?;
-    let pool = DispatchPool::new(&device, 0)?;
-    let kernel = GpuKernel::load(&device, &hsaco, &KernelLoadConfig {
-        workgroup_size: [64, 1, 1],
-        lds_size: 0,
-    })?;
+## 入门示例 / Getting Started
 
-    // 准备数据: A[32,64] × B^T[128,64] = C[32,128]
-    let m = 32; let k = 64; let n = 128;
-    let a_buf = device.alloc_vram(m * k * 2)?;  // bf16
-    let b_buf = device.alloc_vram(n * k * 2)?;  // bf16 (N×K, 已转置)
-    let c_buf = device.alloc_vram(m * n * 4)?;  // f32 输出
+### 1. hello_gemm — 最小端到端 GPU 工作流
 
-    // 填充随机 bf16 数据 (略)
-    // ...
+演示完整的裸金属 GPU 工作流：T0 编译向量加法内核 → KFD 分配 VRAM → dispatch → 读回结果。
 
-    // 调度
-    let mut ka = [0u8; 32];
-    ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
-    ka[8..16].copy_from_slice(&b_buf.gpu_addr().to_le_bytes());
-    ka[16..24].copy_from_slice(&c_buf.gpu_addr().to_le_bytes());
-    ka[24..28].copy_from_slice(&(k as u32).to_le_bytes());
-    ka[28..32].copy_from_slice(&(n as u32).to_le_bytes());
-
-    let grid_x = ((n + 63) / 64) as u32 * 64;
-    let grid_y = ((m + 31) / 32) as u32;
-    let ka_va = pool.write_kernargs(0, &ka);
-    queue.submit(&kernel, [grid_x, grid_y, 1], ka_va);
-    queue.wait_idle()?;
-
-    // 读取结果
-    let mut result = vec![0f32; m * n];
-    c_buf.read(unsafe {
-        std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, m * n * 4)
-    });
-    println!("C[0,0] = {}", result[0]);
-    Ok(())
-}
+```bash
+cargo run --example hello_gemm --features rocm --release
 ```
 
-## 2. 自定义逐元素内核
+### 2. hello_gemm_gen — 自动选择 GEMM
 
-```rust
-// 用 T0 math 定义: y = x² + 2x + 1
-fn square_plus(sched: &dyn Schedule) -> T0Kernel {
-    // T0 自动处理：线程映射、全局加载、存储、grid 计算
-    t0_elementwise_unary(|x| {
-        let x2 = mul(x, x);
-        let two_x = mul(x, const_f32(2.0));
-        add(add(x2, two_x), const_f32(1.0))
-    })
-}
+演示 `auto_select(M, K, N)` 自动选择最优 GEMM 配置，编译并验证正确性。
+
+```bash
+cargo run --example hello_gemm_gen --features rocm --release
 ```
 
-## 3. 自定义注意力机制
+### 3. qwen3_infer — Qwen3 推理
 
-这是 T0 的核心价值 — 定义任意注意力变体：
+完整的 Qwen3-0.6B/4B 推理流水线：tokenizer → prefill → decode → generate。
 
-```rust
-// 示例：线性注意力 (不用 softmax)
-fn linear_attention() -> T0Kernel {
-    // O = (Q @ K^T) @ V
-    // 无 softmax，直接矩阵乘
-    let qk = wmma_matmul(q, k_t);     // [M, N] 注意力矩阵
-    let out = wmma_matmul(qk, v);     // [M, D] 输出
-    output_f32("O", out)
-}
-
-// 示例：OCPA chunk-wise 注意力
-fn ocpa_intra_attention() -> T0Kernel {
-    // S_intra = tril(Q @ K^T)        // 因果掩码
-    // O_intra = S_intra @ V
-    let qk = wmma_matmul(q, k_t);
-    let qk_causal = apply_causal_mask(qk);
-    let out = wmma_matmul(qk_causal, v);
-    output_f32("O", out)
-}
+```bash
+cargo run --release --features rocm --example qwen3_infer -- \
+  --model-path /path/to/Qwen3-0.6B \
+  --prompt "Hello, who are you?" \
+  --max-tokens 128 \
+  --temperature 0.7
 ```
 
-## 源文件索引
+### 4. train_mlp — 端到端训练
 
-| 现有实现 | 路径 | 说明 |
-|---------|------|------|
-| matmul_direct | `t0/math.rs` | bf16 WMMA GEMM (NT) |
-| OCPA forward intra | `kernels/ocpa_forward_intra.rs` | chunk 内因果注意力 |
-| OCPA backward intra | `kernels/ocpa_backward_intra.rs` | chunk 内反向 |
-| Softmax + CE Loss | `kernels/softmax_ce_loss.rs` | 融合 softmax+交叉熵 |
-| Ada-GLAM 优化器 | `kernels/ada_glam_kernels.rs` | 12 个优化器内核 |
+2 层 MLP 训练演示：Embedding → GEMM+ReLU → GEMM → Softmax+CE Loss → AdamW 更新。所有内核由 T0 编译，KFD 裸金属调度。
+
+```bash
+cargo run --example train_mlp --features rocm --release
+```
+
+---
+
+## 正确性测试 / Correctness Tests
+
+### test_gemm_correctness — GEMM 正确性验证
+
+测试所有 T0 GEMM 配置，对比 CPU bf16 参考实现。使用随机 bf16 数据检测系统性误差。
+
+```bash
+cargo run --example test_gemm_correctness --features rocm --release
+```
+
+### test_gemm_backward — GEMM 反向传播验证
+
+验证反向传播：`dX = dY @ W^T`（反向数据）和 `dW = dY^T @ X`（反向权重）。
+
+```bash
+cargo run --example test_gemm_backward --features rocm --release
+```
+
+---
+
+## 性能基准 / Benchmarks
+
+### bench_gemm — GEMM 性能基准
+
+跨多种矩阵尺寸测试 T0 编译的 GEMM 内核，报告 TFLOPS。
+
+```bash
+cargo run --example bench_gemm --features rocm --release
+```
+
+### bench_gemm_sweep — GEMM 变体扫描
+
+编译所有 `GemmConfig` 变体，跨多种矩阵尺寸基准测试，报告每种尺寸的最优配置。
+
+```bash
+cargo run --example bench_gemm_sweep --features rocm --release
+```
+
+### bench_tile_gemm — TileIR GEMM 基准
+
+测试生产级 tile_ir 编译路径（SSA 优化、graduated waitcnt、双缓冲、WMMA 16x16x16）。
+
+```bash
+cargo run --example bench_tile_gemm --features rocm --release
+```
+
+### bench_tile_ir — TileIR vs gemm_gen 对比
+
+对比 tile_ir（编译器生成）与 gemm_gen（手写）GEMM 内核的性能差异。
+
+```bash
+cargo run --example bench_tile_ir --features rocm --release
+```
+
+### bench_tile_ir_vs_gemm_gen — 编译器 vs 生成器深度对比
+
+两条编译路径的 NT 模式 GEMM（bf16 输入，f32 输出）深度对比。
+
+```bash
+cargo run --example bench_tile_ir_vs_gemm_gen --features rocm --release
+```
+
+### bench_kfd_dispatch — KFD 调度延迟
+
+裸金属 KFD 调度延迟基准测试。
+
+```bash
+cargo run --example bench_kfd_dispatch --features rocm --release
+```
+
+### bench_split_k — Split-K GEMM
+
+测试 Split-K 策略在小矩阵上的并行化效果。
+
+```bash
+cargo run --example bench_split_k --features rocm --release
+```
+
+### bench_wgp_vs_cu — WGP vs CU 模式对比
+
+对比 Workgroup Processor 模式（WG 跨 2 CU = 128KB LDS + 4 SIMD）与标准 CU 模式。
+
+```bash
+cargo run --example bench_wgp_vs_cu --features rocm --release
+```
+
+### bench_small_matrix — 小矩阵调度开销
+
+测量小矩阵的调度开销和单 CU 效率。
+
+```bash
+cargo run --example bench_small_matrix --features rocm --release
+```
+
+### bench_thin_matrix — 窄矩阵基准
+
+M=128/256 × K=1024 × N=4096 的 tile/WGP/split-K/grid 组合测试。
+
+```bash
+cargo run --example bench_thin_matrix --features rocm --release
+```
+
+### bench_128x4096 — 深 K 优化
+
+128×1024×4096 矩阵的 k32/k64 tile + WGP 优化测试。
+
+```bash
+cargo run --example bench_128x4096 --features rocm --release
+```
+
+### bench_256_sweep — 256³ 全配置扫描
+
+绕过 Ignis bf16 转换开销，直接写入 GPU 的 256³ 矩阵全配置扫描。
+
+```bash
+cargo run --example bench_256_sweep --features rocm --release
+```
+
+### bench_t0_unified — T0 统一基准
+
+测试 T0 编译器各编译链路的 GEMM 性能。
+
+```bash
+cargo run --example bench_t0_unified --features rocm --release
+```
+
+### bench_block_dsl_gemm — BlockDSL GEMM 基准
+
+BlockDSL `gemm_tn_naive` 跨矩阵尺寸基准测试。
+
+```bash
+cargo run --example bench_block_dsl_gemm --features rocm --release
+```
+
+### bench_auto_select — 自动选择验证
+
+验证 `auto_select` 在不同尺寸下的配置选择安全性。
+
+```bash
+cargo run --example bench_auto_select --features rocm --release
+```
+
+---
+
+## 调试工具 / Debug Tools
+
+### analyze_gemm_isa — ISA 指令分析
+
+导出 GEMM 内核汇编并统计指令类别分布。
+
+```bash
+cargo run --example analyze_gemm_isa --release
+```
+
+### dump_asm — 汇编导出
+
+导出 T0 编译内核的 GFX1100 ISA 汇编。
+
+```bash
+cargo run --example dump_asm --release
+```
+
+### debug_tile_ir — TileIR 调试
+
+对比 tile_ir 和 gemm_gen 对同一尺寸生成的汇编，用最小尺寸单 tile 测试 GPU 执行。
+
+```bash
+cargo run --example debug_tile_ir --features rocm --release
+```
+
+---
+
+## 内置内核 / Kernel Sources
+
+`kernels/` 目录包含手写 ISA 内核：
+
+| 文件 | 说明 |
+|---|---|
+| `ocpa_forward_intra.rs` | OCPA chunk 内因果注意力前向 |
+| `ocpa_backward_intra.rs` | OCPA chunk 内注意力反向 |
+| `ocpa_state_update.rs` | OCPA 状态更新 |
+| `softmax_ce_loss.rs` | 融合 Softmax + 交叉熵损失 |
