@@ -1,6 +1,10 @@
-//! GPU Profiler — op-level profiling with I/O shape tracking.
+//! GPU Profiler — CPU/GPU interaction timeline with I/O shape tracking.
 //!
 //! Enabled via `--features profile`. Zero-cost when disabled.
+//!
+//! Chrome tracing output has two tracks:
+//! - tid=0: CPU (dispatch + wait)
+//! - tid=1: GPU (kernel execution, estimated or measured)
 //!
 //! # Usage
 //!
@@ -9,22 +13,25 @@
 //!
 //! profiler::begin("attention_qk");
 //! profiler::set_shapes(
-//!     vec![profiler::ShapeInfo::new(&[32, 128, 128])],  // inputs
-//!     vec![profiler::ShapeInfo::new(&[32, 128, 128])],  // outputs
+//!     vec![profiler::ShapeInfo::new(&[32, 128, 128])],
+//!     vec![profiler::ShapeInfo::new(&[32, 128, 128])],
 //! );
 //! // ... dispatch kernels ...
 //! profiler::end("attention_qk");
 //!
-//! profiler::report();
+//! profiler::report();        // human-readable table
+//! profiler::to_json();       // Chrome tracing JSON
 //! ```
 
 mod op_profiler;
+mod gpu_timestamp;
 
 pub use op_profiler::{OpProfiler, OpRecord, ShapeInfo};
+pub use gpu_timestamp::GpuTimestamp;
 
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-static GLOBAL_PROFILER: Mutex<OpProfiler> = Mutex::new(OpProfiler::new());
+static GLOBAL_PROFILER: LazyLock<Mutex<OpProfiler>> = LazyLock::new(|| Mutex::new(OpProfiler::new()));
 
 fn with_profiler<F: FnOnce(&mut OpProfiler)>(f: F) {
     if let Ok(mut p) = GLOBAL_PROFILER.lock() {
@@ -40,8 +47,6 @@ pub fn begin(name: &'static str) {
 }
 
 /// Set input/output shapes for the currently open op.
-///
-/// Call after `begin()` and before `end()`. No-op if profiling is disabled.
 #[inline]
 pub fn set_shapes(inputs: Vec<ShapeInfo>, outputs: Vec<ShapeInfo>) {
     #[cfg(feature = "profile")]
@@ -62,12 +67,19 @@ pub fn record_kernel(name: &'static str, cpu_ns: u64) {
     with_profiler(|p| p.record_kernel(name, cpu_ns));
 }
 
+/// Set GPU execution time for the most recent record with the given name.
+#[inline]
+pub fn record_gpu_timing(name: &'static str, gpu_ns: u64) {
+    #[cfg(feature = "profile")]
+    with_profiler(|p| p.record_gpu_timing(name, gpu_ns));
+}
+
 /// Print human-readable profiling report to stderr.
 pub fn report() {
     with_profiler(|p| p.report());
 }
 
-/// Export profiling data as Chrome tracing JSON.
+/// Export profiling data as Chrome tracing JSON with CPU/GPU dual tracks.
 pub fn to_json() -> String {
     GLOBAL_PROFILER.lock().map(|p| p.to_json()).unwrap_or_default()
 }

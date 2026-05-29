@@ -574,6 +574,22 @@ mod tests {
         eprintln!("✓ bf16_store_test: {} bytes ELF", ck.elf.len());
     }
 
+    #[test]
+    fn test_f32_to_bf16_padded_compiles() {
+        let kb = build_f32_to_bf16_padded();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("f32_to_bf16_padded compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ f32_to_bf16_padded: {} bytes ELF", ck.elf.len());
+    }
+
+    #[test]
+    fn test_f32_to_bf16_transpose_padded_compiles() {
+        let kb = build_f32_to_bf16_transpose_padded();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("f32_to_bf16_tp compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ f32_to_bf16_transpose_padded: {} bytes ELF", ck.elf.len());
+    }
+
     #[cfg(feature = "rocm")]
     #[test]
     fn test_bf16_store_gpu() {

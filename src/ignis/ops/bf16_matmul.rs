@@ -393,7 +393,7 @@ fn unpad_f32(
 // ── BF16 conversion helpers with padding ──
 
 /// Convert f32 [rows, cols] → bf16 [rows_padded, cols_padded] with per-row padding.
-/// GPU kernel path — falls back to CPU if GPU dispatch fails.
+/// CPU path (GPU store_bf16 causes hang with large matrices in inference pipeline).
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -426,7 +426,7 @@ fn f32_to_bf16_gpu_padded(
 }
 
 /// Convert f32 [rows, cols] → bf16 [cols_padded, rows_padded] transposed with padding.
-/// GPU kernel path — falls back to CPU if GPU dispatch fails.
+/// CPU path (GPU transpose causes hang with large matrices — needs investigation).
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_transpose_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -597,5 +597,49 @@ mod gemm_debug_tests {
             let row: Vec<String> = (0..3).map(|j| format!("{:.4}", raw[i * n_pad + j])).collect();
             eprintln!("  row {}: [{}]", i, row.join(", "));
         }
+    }
+
+    #[test]
+    fn test_gemm_attention_size() {
+        // Test GEMM with attention-like dimensions: M=1, K=128, N=128
+        let r = rt();
+        let m = 1;
+        let k = 128;
+        let n = 128;
+
+        let mut rng_state = 42u64;
+        let mut rand = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.5
+        };
+
+        let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+
+        let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += x_data[i * k + kk] * w_data[kk * n + j];
+                }
+                expected[i * n + j] = sum;
+            }
+        }
+
+        let mut max_err: f32 = 0.0;
+        for i in 0..m * n {
+            let err = (y_data[i] - expected[i]).abs();
+            max_err = max_err.max(err);
+        }
+        eprintln!("GEMM {}x{}x{} max_err={:.6}", m, k, n, max_err);
+        assert!(max_err < 0.1, "GEMM max_err={}", max_err);
     }
 }
