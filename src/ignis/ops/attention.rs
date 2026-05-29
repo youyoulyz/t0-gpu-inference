@@ -37,10 +37,19 @@ pub fn standard_attention(
     head_dim: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("standard_attention");
     use crate::t0::attention_kernels as ak;
 
     let q_shape = q.shape();
     let k_shape = k.shape();
+    crate::profiler::set_shapes(
+        vec![
+            crate::profiler::ShapeInfo::new(q_shape),
+            crate::profiler::ShapeInfo::new(k_shape),
+            crate::profiler::ShapeInfo::new(v.shape()),
+        ],
+        vec![crate::profiler::ShapeInfo::new(&[q_shape[0], n_heads * head_dim])],
+    );
     assert!(q_shape.len() == 2, "q: expected [seq, n_heads*head_dim]");
     assert!(k_shape.len() == 2, "k: expected [kv_len, n_kv_heads*head_dim]");
 

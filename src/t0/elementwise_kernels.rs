@@ -341,6 +341,29 @@ pub fn build_memcpy_kv_x16() -> BlockKernel {
 
 // ── BF16 conversion kernels ──
 
+/// Minimal f32→bf16 store test kernel (for debugging store_bf16 hang).
+///
+/// Kernarg layout: [src:u64, dst:u64, n:u32]
+/// Grid: ((n + WG_SIZE - 1) / WG_SIZE * WG_SIZE, 1)
+pub fn build_bf16_store_test() -> BlockKernel {
+    let mut kb = BlockKernel::new("bf16_store_test", WG_SIZE);
+
+    let src = kb.arg_ptr("src");
+    let dst = kb.arg_ptr("dst");
+    let n = kb.arg_u32("n");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+    let wg_size = kb.const_u32(WG_SIZE);
+    let offset = pid.mul(&mut kb, wg_size).add(&mut kb, tid);
+    let in_bounds = offset.lt(&mut kb, n);
+
+    let val = kb.load(src, offset, in_bounds);
+    kb.store_bf16(dst, offset, val, in_bounds);
+
+    kb
+}
+
 /// f32 → bf16 conversion with per-row padding.
 ///
 /// Converts f32 [real_rows, real_cols] → bf16 [pad_rows, pad_cols].
@@ -541,5 +564,82 @@ mod tests {
         }
         assert!(max_err < 1e-5, "residual_add max_err={}", max_err);
         eprintln!("✓ residual_add GPU: n={}, max_err={:.2e}", n, max_err);
+    }
+
+    #[test]
+    fn test_bf16_store_compiles() {
+        let kb = build_bf16_store_test();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("bf16_store compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ bf16_store_test: {} bytes ELF", ck.elf.len());
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_bf16_store_gpu() {
+        use crate::ignis::gpu_context::GpuRuntime;
+        use std::sync::{Arc, OnceLock};
+
+        struct SyncRt(Arc<GpuRuntime>);
+        unsafe impl Sync for SyncRt {}
+        unsafe impl Send for SyncRt {}
+        static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+
+        let rt = GPU_RT.get_or_init(|| {
+            SyncRt(GpuRuntime::new().expect("GPU runtime"))
+        }).0.clone();
+
+        let n: u32 = 64;
+        let f32_data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
+        let src_buf = rt.upload_f32(&f32_data).unwrap();
+        // bf16 output: n elements × 2 bytes
+        let dst_buf = rt.alloc(((n as usize * 2) + 255) & !255).unwrap();
+        dst_buf.zero();
+
+        let kernel = rt.ensure_kernel_blockdsl("bf16_store_test", || build_bf16_store_test()).unwrap();
+
+        let grid = ((n + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
+        let ka = crate::kernargs![
+            src_buf.gpu_addr() => u64,
+            dst_buf.gpu_addr() => u64,
+            n => u32
+        ];
+        rt.dispatch(&kernel, [grid, 1, 1], &ka).expect("dispatch");
+
+        // Also test the padded kernel with multiple workgroups
+        let rows: u32 = 16;
+        let cols: u32 = 8;
+        let pad_cols: u32 = 16;
+        let f32_data2: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.05).collect();
+        let src_buf2 = rt.upload_f32(&f32_data2).unwrap();
+        let dst_buf2 = rt.alloc(((rows * pad_cols * 2) as usize + 255) & !255).unwrap();
+        dst_buf2.zero();
+
+        let kernel2 = rt.ensure_kernel_blockdsl("f32_to_bf16_pad", || build_f32_to_bf16_padded()).unwrap();
+        let grid2 = f32_to_bf16_grid(rows);
+        let ka2 = crate::kernargs![
+            src_buf2.gpu_addr() => u64,
+            dst_buf2.gpu_addr() => u64,
+            cols => u32,
+            pad_cols => u32
+        ];
+        rt.dispatch(&kernel2, [grid2, 1, 1], &ka2).expect("padded dispatch");
+
+        // Read back bf16 data and verify against CPU conversion
+        // Note: GPU uses truncation (shift right 16), CPU uses round-to-nearest-even.
+        // Allow ±1 ULP difference.
+        let mut bf16_bytes = vec![0u8; n as usize * 2];
+        dst_buf.read(&mut bf16_bytes);
+        for i in 0..n as usize {
+            let bf16_bits = u16::from_le_bytes([bf16_bytes[i * 2], bf16_bytes[i * 2 + 1]]);
+            let src_val = f32_data[i];
+            // CPU round-to-nearest-even conversion
+            let src_bf16_bits = ((src_val.to_bits() + 0x7FFF + ((src_val.to_bits() >> 16) & 1)) >> 16) as u16;
+            let diff = (bf16_bits as i32 - src_bf16_bits as i32).abs();
+            assert!(diff <= 1,
+                "[{}] bf16 mismatch > 1 ULP: got 0x{:04x}, expected 0x{:04x} (src={})",
+                i, bf16_bits, src_bf16_bits, src_val);
+        }
+        eprintln!("✓ bf16_store_test GPU: n={}, all values within 1 ULP", n);
     }
 }

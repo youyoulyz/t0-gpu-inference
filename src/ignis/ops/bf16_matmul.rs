@@ -31,6 +31,7 @@ use super::super::gpu_context::GpuRuntime;
 /// Pads M/N to tile boundaries to handle any dimension.
 #[cfg(feature = "rocm")]
 pub fn matmul(x: &Tensor, w: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    crate::profile_scope!("matmul");
     let x_shape = x.shape();
     let w_shape = w.shape();
     assert_eq!(x_shape.len(), 2, "matmul: X must be 2D, got {:?}", x_shape);
@@ -123,6 +124,7 @@ pub fn matmul_with_wt_bf16(
     m: usize, k: usize, n: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("matmul_wt_bf16");
     use crate::t0::gemm_gen::{self, GemmConfig};
 
     let cfg = select_config(m);
@@ -162,6 +164,14 @@ pub fn gemm_f32_raw(
     b_f32: &GpuBuffer,  // [K, N]
     m: usize, k: usize, n: usize,
 ) -> Result<GpuBuffer, String> {
+    crate::profile_scope!("bf16_gemm");
+    crate::profiler::set_shapes(
+        vec![
+            crate::profiler::ShapeInfo::new(&[m, k]),
+            crate::profiler::ShapeInfo::new(&[k, n]),
+        ],
+        vec![crate::profiler::ShapeInfo::new(&[m, n])],
+    );
     dispatch_gemm_forward(runtime, a_f32, b_f32, m, k, n)
 }
 
@@ -383,7 +393,7 @@ fn unpad_f32(
 // ── BF16 conversion helpers with padding ──
 
 /// Convert f32 [rows, cols] → bf16 [rows_padded, cols_padded] with per-row padding.
-/// CPU conversion path (GPU store_bf16 causes hang — needs investigation).
+/// GPU kernel path — falls back to CPU if GPU dispatch fails.
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -416,7 +426,7 @@ fn f32_to_bf16_gpu_padded(
 }
 
 /// Convert f32 [rows, cols] → bf16 [cols_padded, rows_padded] transposed with padding.
-/// CPU conversion path (GPU store_bf16 causes hang — needs investigation).
+/// GPU kernel path — falls back to CPU if GPU dispatch fails.
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_transpose_gpu_padded(
     runtime: &Arc<GpuRuntime>,
