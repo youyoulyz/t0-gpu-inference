@@ -7,10 +7,10 @@
 //!
 //! # Usage
 //! ```ignore
-//! use t0_gpu::t0::safe_mode::safe_dispatch::SafeDispatcher;
+//! use t0_gpu::t0::safe_mode::safe_dispatch::{SafeDispatcher, SafeDispatchConfig};
 //!
-//! let dispatcher = SafeDispatcher::new(rt);
-//! dispatcher.safe_dispatch(&kernel, [256, 1, 1], &kernarg, None)?;
+//! let mut dispatcher = SafeDispatcher::with_defaults();
+//! dispatcher.safe_dispatch(&queue, &kernel, [256, 1, 1], &kernarg_buf)?;
 //! ```
 //!
 //! # Limitations
@@ -100,7 +100,7 @@ pub struct DispatchLog {
 
 /// Safe dispatcher — wraps GPU dispatch with timeout and logging.
 ///
-/// Works with the existing GpuRuntime. Does NOT create isolated queues
+/// Works with AqlQueue. Does NOT create isolated queues
 /// (that would require KFD-level changes). Instead, adds timeout
 /// monitoring and pre-dispatch validation.
 #[cfg(feature = "rocm")]
@@ -122,44 +122,46 @@ impl SafeDispatcher {
     /// Safely dispatch a kernel with timeout monitoring.
     ///
     /// # Arguments
-    /// * `rt` — GPU runtime
+    /// * `queue` — AQL compute queue
     /// * `kernel` — Compiled kernel
     /// * `grid` — Grid dimensions [x, y, z]
-    /// * `kernarg` — Kernel argument bytes
+    /// * `kernarg` — Kernel argument buffer (GPU-resident)
     ///
     /// # Returns
     /// `Ok(())` if the kernel completed within the timeout.
     pub fn safe_dispatch(
         &mut self,
-        rt: &crate::kfd::GpuRuntime,
+        queue: &crate::kfd::AqlQueue,
         kernel: &crate::kfd::GpuKernel,
         grid: [u32; 3],
-        kernarg: &[u8],
+        kernarg: &crate::kfd::GpuBuffer,
     ) -> Result<(), DispatchError> {
         let start = Instant::now();
+        let kernel_label = format!("kernel@{:#x}", kernel.descriptor_va);
+        let code_size = kernel.code_buffer.size;
 
         // Pre-dispatch logging
         if self.config.log_dispatches {
-            eprintln!("[SafeDispatch] Dispatching kernel '{}' grid={:?} wg={:?} code={}B",
-                kernel.name, grid, kernel.workgroup_size, kernel.code_size);
+            eprintln!("[SafeDispatch] Dispatching {} grid={:?} wg={:?} code={}B",
+                kernel_label, grid, kernel.workgroup_size, code_size);
         }
 
         // Code size check
-        if kernel.code_size > self.config.max_code_size {
+        if code_size > self.config.max_code_size {
             return Err(DispatchError::CodeTooLarge {
-                size: kernel.code_size,
+                size: code_size,
                 max: self.config.max_code_size,
             });
         }
 
         // Submit
-        let submit_result = rt.dispatch_async(kernel, grid, kernarg);
+        let submit_result = queue.dispatch(kernel, grid, kernarg);
         if let Err(e) = submit_result {
             let log_entry = DispatchLog {
-                kernel_name: kernel.name.clone(),
+                kernel_name: kernel_label.clone(),
                 grid,
                 workgroup_size: kernel.workgroup_size,
-                code_size: kernel.code_size,
+                code_size,
                 start_time: start,
                 elapsed: Some(start.elapsed()),
                 success: false,
@@ -175,10 +177,10 @@ impl SafeDispatcher {
             if wait_start.elapsed() > self.config.timeout {
                 let elapsed = start.elapsed();
                 let log_entry = DispatchLog {
-                    kernel_name: kernel.name.clone(),
+                    kernel_name: kernel_label,
                     grid,
                     workgroup_size: kernel.workgroup_size,
-                    code_size: kernel.code_size,
+                    code_size,
                     start_time: start,
                     elapsed: Some(elapsed),
                     success: false,
@@ -189,37 +191,40 @@ impl SafeDispatcher {
             }
 
             // Check if GPU is idle
-            match rt.wait_idle_timeout(Duration::from_millis(100)) {
-                Ok(true) => break, // idle
-                Ok(false) => continue, // still running
+            match queue.wait_idle() {
+                Ok(()) => break,
                 Err(e) => {
-                    let log_entry = DispatchLog {
-                        kernel_name: kernel.name.clone(),
-                        grid,
-                        workgroup_size: kernel.workgroup_size,
-                        code_size: kernel.code_size,
-                        start_time: start,
-                        elapsed: Some(start.elapsed()),
-                        success: false,
-                        error: Some(e.clone()),
-                    };
-                    self.log.push(log_entry);
-                    return Err(DispatchError::RuntimeError(e));
+                    // wait_idle returned error — retry until timeout
+                    if wait_start.elapsed() > self.config.timeout {
+                        let log_entry = DispatchLog {
+                            kernel_name: kernel_label,
+                            grid,
+                            workgroup_size: kernel.workgroup_size,
+                            code_size,
+                            start_time: start,
+                            elapsed: Some(start.elapsed()),
+                            success: false,
+                            error: Some(e),
+                        };
+                        self.log.push(log_entry);
+                        return Err(DispatchError::Timeout { elapsed: start.elapsed(), grid });
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
                 }
             }
         }
 
         let elapsed = start.elapsed();
         if self.config.log_dispatches {
-            eprintln!("[SafeDispatch] Kernel '{}' completed in {:.3}ms",
-                kernel.name, elapsed.as_secs_f64() * 1000.0);
+            eprintln!("[SafeDispatch] {} completed in {:.3}ms",
+                kernel_label, elapsed.as_secs_f64() * 1000.0);
         }
 
         let log_entry = DispatchLog {
-            kernel_name: kernel.name.clone(),
+            kernel_name: kernel_label,
             grid,
             workgroup_size: kernel.workgroup_size,
-            code_size: kernel.code_size,
+            code_size,
             start_time: start,
             elapsed: Some(elapsed),
             success: true,
@@ -255,26 +260,24 @@ impl SafeDispatcher {
     }
 }
 
-/// Timeout-aware wait helper for the KFD runtime.
+/// Timeout-aware wait helper for the AQL queue.
 ///
 /// Polls the GPU queue with a deadline. Returns:
-/// - `Ok(true)` if GPU became idle within timeout
-/// - `Ok(false)` if still running (caller should loop)
-/// - `Err(msg)` if queue error
+/// - `Ok(())` if GPU became idle within timeout
+/// - `Err(msg)` if timeout or queue error
 #[cfg(feature = "rocm")]
 pub fn wait_idle_with_timeout(
-    rt: &crate::kfd::GpuRuntime,
+    queue: &crate::kfd::AqlQueue,
     timeout: Duration,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let start = Instant::now();
     loop {
-        match rt.wait_idle() {
-            Ok(()) => return Ok(true),
+        match queue.wait_idle() {
+            Ok(()) => return Ok(()),
             Err(e) => {
                 if start.elapsed() > timeout {
                     return Err(format!("Timeout after {:.1}s: {}", timeout.as_secs_f32(), e));
                 }
-                // Brief sleep before retry
                 std::thread::sleep(Duration::from_micros(100));
             }
         }
