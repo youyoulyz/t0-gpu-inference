@@ -27,6 +27,7 @@ mod op_profiler;
 mod gpu_timestamp;
 
 pub use op_profiler::{OpProfiler, OpRecord, ShapeInfo};
+#[cfg(feature = "rocm")]
 pub use gpu_timestamp::GpuTimestamp;
 
 use std::sync::{LazyLock, Mutex};
