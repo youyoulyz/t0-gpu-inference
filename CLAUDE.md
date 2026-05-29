@@ -41,9 +41,27 @@ T0_DUMP_ASM=1 cargo test --release --features rocm -- <test_name>
 # Run examples
 cargo run --release --features rocm --example test_gemm_correctness
 cargo run --release --features rocm --example hello_gemm_gen
+
+# Qwen3 inference
+cargo run --release --features rocm --example qwen3_infer -- \
+  --model-path /path/to/Qwen3-0.6B --prompt "Hello" --max-tokens 32 --temperature 0.7
+
+# CPU reference tests for inference ops (requires --features rocm)
+cargo test --release --features rocm --lib -- "cpu_qk_norm" --nocapture --test-threads=1
+cargo test --release --features rocm --lib -- "cpu_attention" --nocapture --test-threads=1
+cargo test --release --features rocm --lib -- "cpu_sample" --nocapture --test-threads=1
+cargo test --release --features rocm --lib -- "test_rope" --nocapture --test-threads=1
 ```
 
 **GPU tests must always use `--test-threads=1`** to avoid GPU resource contention.
+
+## Qwen3 Inference
+
+See `docs/Qwen3_推理引擎_架构与实现.md` for full documentation.
+
+Key files: `nn/config.rs` (head_dim fix), `nn/transformer.rs` (QK-norm + RoPE + attention), `nn/model.rs` (prefill/decode/generate), `ops/rope.rs`, `ops/qk_norm.rs`, `ops/attention.rs`, `examples/qwen3_infer.rs`.
+
+Model directory: `/mnt/public/models/huggingface/Qwen3-0.6B` (downloaded). Config: head_dim=128, 28 layers, 16 Q heads, 8 KV heads, hidden=1024, vocab=151936.
 
 ## Architecture
 
