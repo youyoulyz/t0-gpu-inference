@@ -43,3 +43,6 @@ pub mod kfd;
 // ── Ignis — GPU-native autodiff framework ──
 #[cfg(feature = "rocm")]
 pub mod ignis;
+
+// ── GPU Profiler ──
+pub mod profiler;

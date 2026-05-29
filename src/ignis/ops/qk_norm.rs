@@ -33,6 +33,11 @@ pub fn qk_norm(
     head_dim: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("qk_norm");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+    );
     let shape = x.shape();
     assert!(shape.len() == 2, "qk_norm: expected 2D, got {:?}", shape);
     assert_eq!(shape[1], n_heads * head_dim, "qk_norm: dim mismatch");

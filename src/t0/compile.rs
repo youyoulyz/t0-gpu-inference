@@ -1149,6 +1149,7 @@ impl T0Kernel {
 
     /// Compile this kernel to a GPU code object (ELF binary).
     pub fn compile(&self, target: Target) -> Result<Vec<u8>, String> {
+        crate::profile_scope!("t0_compile");
         // ISA static verification: detect known hang patterns before emitting code.
         // Active in debug builds or when KFD_VERIFY=1 env var is set.
         #[cfg(debug_assertions)]

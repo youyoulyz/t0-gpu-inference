@@ -25,6 +25,11 @@ pub fn softmax(
     input: &Tensor,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("softmax");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(input.shape())],
+        vec![crate::profiler::ShapeInfo::new(input.shape())],
+    );
     let n = input.shape().last().copied().unwrap_or(0);
     let batch = input.numel() / n;
 

@@ -37,6 +37,11 @@ pub fn cross_entropy(
     vocab_size: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("cross_entropy");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(logits.shape())],
+        vec![crate::profiler::ShapeInfo::new(&[logits.shape()[0]])],
+    );
     let batch = logits.numel() / vocab_size;
     let cols = vocab_size;
 

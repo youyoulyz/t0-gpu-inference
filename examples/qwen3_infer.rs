@@ -83,6 +83,16 @@ fn main() {
         elapsed.as_secs_f64(),
         generated_ids.len() as f64 / elapsed.as_secs_f64()
     );
+
+    // Profiler report (if --profile flag was set)
+    if args.profile {
+        t0_gpu::profiler::report();
+    }
+    if args.profile_json {
+        let json = t0_gpu::profiler::to_json();
+        std::fs::write("profile_trace.json", &json).expect("write profile_trace.json");
+        eprintln!("Chrome tracing JSON written to profile_trace.json");
+    }
 }
 
 struct Args {
@@ -92,6 +102,8 @@ struct Args {
     temperature: f32,
     top_p: f32,
     max_seq_len: usize,
+    profile: bool,
+    profile_json: bool,
 }
 
 fn parse_args() -> Args {
@@ -101,6 +113,8 @@ fn parse_args() -> Args {
     let mut temperature = 0.7f32;
     let mut top_p = 0.9f32;
     let mut max_seq_len = 2048usize;
+    let mut profile = false;
+    let mut profile_json = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -112,6 +126,8 @@ fn parse_args() -> Args {
             "--temperature" => { i += 1; temperature = args[i].parse().unwrap(); }
             "--top-p" => { i += 1; top_p = args[i].parse().unwrap(); }
             "--max-seq-len" => { i += 1; max_seq_len = args[i].parse().unwrap(); }
+            "--profile" => { profile = true; }
+            "--profile-json" => { profile_json = true; }
             _ => {
                 eprintln!("Unknown arg: {}", args[i]);
                 std::process::exit(1);
@@ -125,5 +141,5 @@ fn parse_args() -> Args {
         std::process::exit(1);
     }
 
-    Args { model_path, prompt, max_tokens, temperature, top_p, max_seq_len }
+    Args { model_path, prompt, max_tokens, temperature, top_p, max_seq_len, profile, profile_json }
 }

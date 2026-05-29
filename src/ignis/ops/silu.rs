@@ -24,6 +24,11 @@ use super::super::tape::Tape;
 /// - `up`: up projection output [batch*seq, ffn_dim]
 #[cfg(feature = "rocm")]
 pub fn silu_gate(gate: &Tensor, up: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    crate::profile_scope!("silu_gate");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(gate.shape())],
+        vec![crate::profiler::ShapeInfo::new(gate.shape())],
+    );
     assert_eq!(gate.shape(), up.shape(), "silu_gate: shape mismatch");
     let n = gate.numel();
     let runtime = gate.runtime().clone();

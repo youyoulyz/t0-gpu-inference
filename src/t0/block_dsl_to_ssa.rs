@@ -452,6 +452,7 @@ impl BlockKernel {
     ///
     /// For TileGemm mega-ops, routes through `lower_tiled_gemm()` → `tile_ir::lower_gemm()`.
     pub fn compile_via_ssa(&self, target: Target) -> Result<CompiledKernel, String> {
+        crate::profile_scope!("compile_via_ssa");
         // Step 1: Translate to TileFunc SSA
         let func = block_to_ssa(self)?;
 

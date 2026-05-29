@@ -33,6 +33,14 @@ pub fn embedding_forward(
     dim: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("embedding");
+    crate::profiler::set_shapes(
+        vec![
+            crate::profiler::ShapeInfo::new(table.shape()),
+            crate::profiler::ShapeInfo::new(&[seq_len]),
+        ],
+        vec![crate::profiler::ShapeInfo::new(&[seq_len, dim])],
+    );
     // Build gather kernel: 1 wave per token
     let kernel = {
         let name = format!("bdsl_emb_gather_d{}", dim);

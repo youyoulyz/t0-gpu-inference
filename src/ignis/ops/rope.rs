@@ -30,6 +30,11 @@ pub fn rope_forward(
     _rope_theta: f32,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
+    crate::profile_scope!("rope");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+    );
     let shape = x.shape();
     assert!(shape.len() == 2, "rope: expected 2D [n_tokens, dim], got {:?}", shape);
     let n_tokens = shape[0];

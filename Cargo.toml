@@ -11,7 +11,8 @@ repository = "https://github.com/GeisYaO/t0-gpu"
 
 [features]
 default = []
-rocm = []  # Enable KFD runtime (requires /dev/kfd)
+rocm = []      # Enable KFD runtime (requires /dev/kfd)
+profile = []   # Enable profiler instrumentation (zero-cost when disabled)
 
 [dependencies]
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

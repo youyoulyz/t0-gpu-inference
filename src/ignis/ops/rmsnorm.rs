@@ -24,6 +24,11 @@ const EPSILON: f32 = 1e-5;
 /// - output: [rows, dim] f32
 #[cfg(feature = "rocm")]
 pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    crate::profile_scope!("rmsnorm");
+    crate::profiler::set_shapes(
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+        vec![crate::profiler::ShapeInfo::new(x.shape())],
+    );
     let runtime = x.runtime().clone();
     let shape = x.shape().to_vec();
     assert!(shape.len() >= 1, "rmsnorm: need at least 1D");
