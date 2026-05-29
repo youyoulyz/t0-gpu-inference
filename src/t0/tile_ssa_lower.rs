@@ -81,11 +81,11 @@ impl LoweredDotKernel {
         [gx, gy, 1]
     }
 
-    /// 构建 40-byte kernarg buffer
+    /// 构建 44-byte kernarg buffer (含 M 字段)
     pub fn build_kernargs(
         &self, x_addr: u64, wt_addr: u64, y_addr: u64,
         m: u32, k: u32, n: u32,
-    ) -> [u8; 40] {
+    ) -> [u8; 44] {
         gemm_gen::build_kernargs(x_addr, wt_addr, y_addr, k, n, m, &self.config)
     }
 

@@ -415,10 +415,10 @@ pub fn build_kernargs(
     x_addr: u64, wt_addr: u64, y_addr: u64,
     k: u32, n: u32, m: u32,
     cfg: &GemmConfig,
-) -> [u8; 40] {
+) -> [u8; 44] {
     let sk = cfg.split_k.unwrap_or(1);
     let y_stride = if sk > 1 { m * n * 4 } else { 0 };
-    let mut ka = [0u8; 40];
+    let mut ka = [0u8; 44];
     ka[0..8].copy_from_slice(&x_addr.to_le_bytes());
     ka[8..16].copy_from_slice(&wt_addr.to_le_bytes());
     ka[16..24].copy_from_slice(&y_addr.to_le_bytes());
@@ -426,13 +426,14 @@ pub fn build_kernargs(
     ka[28..32].copy_from_slice(&n.to_le_bytes());
     ka[32..36].copy_from_slice(&0u32.to_le_bytes());
     ka[36..40].copy_from_slice(&y_stride.to_le_bytes());
+    ka[40..44].copy_from_slice(&m.to_le_bytes());
     ka
 }
 
-/// Build 48-byte kernarg buffer for a GEMM dispatch with epilogue fusion.
+/// Build 52-byte kernarg buffer for a GEMM dispatch with epilogue fusion.
 ///
-/// Layout (extends 40-byte layout):
-/// [X:u64, WT:u64, Y:u64, K:u32, N:u32, split_k_shift:u32, y_split_stride:u32, bias:u64]
+/// Layout (extends 44-byte layout):
+/// [X:u64, WT:u64, Y:u64, K:u32, N:u32, split_k_shift:u32, y_split_stride:u32, M:u32, bias:u64]
 ///
 /// Set bias_addr=0 for no bias (EpilogueOp::StoreF32).
 pub fn build_kernargs_with_bias(
@@ -440,10 +441,10 @@ pub fn build_kernargs_with_bias(
     k: u32, n: u32, m: u32,
     cfg: &GemmConfig,
     bias_addr: u64,
-) -> [u8; 48] {
+) -> [u8; 52] {
     let sk = cfg.split_k.unwrap_or(1);
     let y_stride = if sk > 1 { m * n * 4 } else { 0 };
-    let mut ka = [0u8; 48];
+    let mut ka = [0u8; 52];
     ka[0..8].copy_from_slice(&x_addr.to_le_bytes());
     ka[8..16].copy_from_slice(&wt_addr.to_le_bytes());
     ka[16..24].copy_from_slice(&y_addr.to_le_bytes());
@@ -451,7 +452,8 @@ pub fn build_kernargs_with_bias(
     ka[28..32].copy_from_slice(&n.to_le_bytes());
     ka[32..36].copy_from_slice(&0u32.to_le_bytes());
     ka[36..40].copy_from_slice(&y_stride.to_le_bytes());
-    ka[40..48].copy_from_slice(&bias_addr.to_le_bytes());
+    ka[40..44].copy_from_slice(&m.to_le_bytes());
+    ka[44..52].copy_from_slice(&bias_addr.to_le_bytes());
     ka
 }
 
@@ -496,7 +498,7 @@ pub fn build_kernargs_backward_data(
     dy_addr: u64, w_addr: u64, dx_addr: u64,
     m: u32, n_orig: u32, k_orig: u32,
     cfg: &GemmConfig,
-) -> [u8; 40] {
+) -> [u8; 44] {
     // NT GEMM: A=dY[M,N], B=W[K,N] (transposed WT), K_contract=N, N_out=K
     build_kernargs(dy_addr, w_addr, dx_addr, n_orig, k_orig, m, cfg)
 }
@@ -530,7 +532,7 @@ pub fn build_kernargs_backward_weight(
     dy_t_addr: u64, x_t_addr: u64, dw_addr: u64,
     m: u32, n_orig: u32, k_orig: u32,
     cfg: &GemmConfig,
-) -> [u8; 40] {
+) -> [u8; 44] {
     // NT GEMM: A=dY_T[N,M], B=X_T[K,M], K_contract=M, N_out=K_orig
     build_kernargs(dy_t_addr, x_t_addr, dw_addr, m, k_orig, n_orig, cfg)
 }
@@ -1358,4 +1360,23 @@ fn generate_direct(cfg: &GemmConfig) -> T0Kernel {
     lds_cfg.use_lds = true;
     lds_cfg.double_buffer = true;
     generate_lds_db(&lds_cfg)
+}
+
+#[cfg(test)]
+mod kernarg_debug {
+    use super::*;
+
+    #[test]
+    fn test_build_kernargs_m_at_40() {
+        let cfg = GemmConfig::tile_16x64_k16();
+        let ka = build_kernargs(0x1000, 0x2000, 0x3000, 16, 64, 3, &cfg);
+        assert_eq!(ka.len(), 44);
+        let m_val = u32::from_le_bytes([ka[40], ka[41], ka[42], ka[43]]);
+        assert_eq!(m_val, 3, "M should be 3 at offset 40, got {}", m_val);
+        let n_val = u32::from_le_bytes([ka[28], ka[29], ka[30], ka[31]]);
+        assert_eq!(n_val, 64, "N should be 64 at offset 28, got {}", n_val);
+        let k_val = u32::from_le_bytes([ka[24], ka[25], ka[26], ka[27]]);
+        assert_eq!(k_val, 16, "K should be 16 at offset 24, got {}", k_val);
+        eprintln!("kernarg bytes: {:?}", &ka[..]);
+    }
 }
