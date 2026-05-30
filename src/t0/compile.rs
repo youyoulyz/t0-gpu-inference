@@ -484,6 +484,11 @@ impl T0Kernel {
         self.ops.push(Op::WaitVscnt(n));
     }
 
+    /// Force L2 cache writeback to VRAM: buffer_wbl2
+    pub fn buffer_wbl2(&mut self, addr: VReg) {
+        self.ops.push(Op::BufferWbl2 { addr });
+    }
+
     /// Clear VCC (s_mov_b32 vcc_lo, 0) — prevents carry residual from mask/cmp ops
     pub fn clear_vcc(&mut self) {
         self.ops.push(Op::ClearVcc);

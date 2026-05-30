@@ -280,6 +280,11 @@ pub enum Op {
     WaitVmcnt(u8),
     WaitLgkmcnt(u8),
     WaitVscnt(u8),
+    /// Force L2 cache writeback to VRAM: buffer_wbl2
+    /// Ensures dirty L2 lines are written back before kernel exit,
+    /// fixing coherency between global_store and buffer_load across dispatches.
+    /// `addr` is the lo VReg of a 64-bit address pair.
+    BufferWbl2 { addr: VReg },
     /// Clear VCC (s_mov_b32 vcc_lo, 0) — prevent carry residual from mask ops
     ClearVcc,
     /// Move VCC_LO from SGPR: s_mov_b32 vcc_lo, src (restore saved mask)
@@ -601,7 +606,8 @@ impl Op {
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) => vec![],
 
             // Sync (no VGPRs)
-            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) | Op::ClearVcc
+            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
+            | Op::BufferWbl2 { .. } | Op::ClearVcc
             | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } => vec![],
             Op::Endpgm => vec![],
 
@@ -850,7 +856,7 @@ impl Op {
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) |
             Op::BranchScc0(_) | Op::BranchVccz(_) |
             Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
-            Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } |
+            Op::BufferWbl2 { .. } | Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } |
             Op::Endpgm | Op::SBarrier => vec![],
 
             // ── Hardware ──
@@ -1035,7 +1041,7 @@ impl Op {
             Op::Branch(_) | Op::BranchVccz(_) |
             Op::Barrier | Op::SBarrier |
             Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
-            Op::ClearVcc | Op::SMovToVcc { .. } |
+            Op::BufferWbl2 { .. } | Op::ClearVcc | Op::SMovToVcc { .. } |
             Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } |
             Op::Endpgm | Op::RawAsm(_) |
             // VCC-writing comparisons (affect cndmask, branches)

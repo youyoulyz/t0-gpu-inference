@@ -195,7 +195,8 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::Barrier | Op::SBarrier => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
-        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) => InsnLatency {
+        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+        Op::BufferWbl2 { .. } => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
         Op::ClearVcc => InsnLatency::salu(),

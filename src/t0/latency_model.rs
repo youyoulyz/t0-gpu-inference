@@ -223,7 +223,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) | Op::BranchVccz(_) |
         Op::Label(_) |
         Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
-        Op::Barrier | Op::SBarrier | Op::Endpgm |
+        Op::BufferWbl2 { .. } | Op::Barrier | Op::SBarrier | Op::Endpgm |
         Op::CaptureTgid { .. } | Op::ComputeGlobalIdX { .. } => ctrl(),
 
         // ── Lane permute: 3 VALU-norm (measured ~27 shader cycles) ──

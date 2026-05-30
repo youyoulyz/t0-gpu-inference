@@ -257,6 +257,7 @@ impl AsmEmitter {
                         self.indent, instr, src_str, vo, sr, sr + 3, soff_str, offset).unwrap();
                 }
                 self.outstanding_vscnt += 1;
+                self.outstanding_vmcnt += 1;  // store also affects vmcnt on GFX1100
             }
 
             Op::GlobalStore { addr, src, width, offset } => {
@@ -276,6 +277,7 @@ impl AsmEmitter {
                     writeln!(self.buf, "{}{} {}, {}, off offset:{}", self.indent, instr, addr_str, src_str, offset).unwrap();
                 }
                 self.outstanding_vscnt += 1;
+                self.outstanding_vmcnt += 1;  // store also affects vmcnt on GFX1100
             }
 
             // ── LDS ──
@@ -559,6 +561,12 @@ impl AsmEmitter {
             Op::SMovToVcc { src } => {
                 let ss = a.phys_s(*src);
                 writeln!(self.buf, "{}s_mov_b32 vcc_lo, s{}", self.indent, ss).unwrap();
+            }
+            Op::BufferWbl2 { addr } => {
+                // TODO: implement buffer_wbl2 with proper SGPR descriptor allocation.
+                // For now, emit a comment placeholder.
+                let _va = a.phys_v(*addr);
+                writeln!(self.buf, "  ; buffer_wbl2: TODO — needs SGPR descriptor setup").unwrap();
             }
 
             // ── Program structure ──

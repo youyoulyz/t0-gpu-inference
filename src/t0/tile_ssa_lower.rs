@@ -590,6 +590,10 @@ fn lower_tile_op(
 
             k.wait_vmcnt(0);
             k.global_store(addr, val_v, width, 0);
+            // Wait for store to commit to L2 before restoring EXEC.
+            // Without this, a partial-width store (b16) may not be visible
+            // to the next kernel's buffer_load, causing GPU hang.
+            k.wait_vscnt(0);
 
             if let Some(saved) = saved_exec {
                 k.restore_exec(saved);
