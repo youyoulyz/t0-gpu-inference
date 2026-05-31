@@ -393,7 +393,7 @@ fn unpad_f32(
 // ── BF16 conversion helpers with padding ──
 
 /// Convert f32 [rows, cols] → bf16 [rows_padded, cols_padded] with per-row padding.
-/// CPU path (GPU store_bf16 causes GEMM hang in inference pipeline — needs investigation).
+/// GPU path with epl loop for dim > WG_SIZE.
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -401,32 +401,27 @@ fn f32_to_bf16_gpu_padded(
     rows: usize, cols: usize,
     rows_padded: usize, cols_padded: usize,
 ) -> Result<GpuBuffer, String> {
-    let n_real = rows * cols;
-    let mut f32_data = vec![0f32; n_real];
-    src.read(unsafe {
-        std::slice::from_raw_parts_mut(f32_data.as_mut_ptr() as *mut u8, n_real * 4)
-    });
+    use crate::t0::elementwise_kernels::{build_f32_to_bf16_padded, f32_to_bf16_grid};
 
-    let n_padded = rows_padded * cols_padded;
-    let mut bf16_data = vec![0u16; n_padded];
-    for r in 0..rows {
-        for c in 0..cols {
-            let bits = f32_data[r * cols + c].to_bits();
-            bf16_data[r * cols_padded + c] = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16;
-        }
-    }
-
-    let bf16_bytes = n_padded * 2;
+    let bf16_bytes = rows_padded * cols_padded * 2;
     let alloc_bytes = (bf16_bytes + 255) & !255;
     let dst = runtime.alloc(alloc_bytes)?;
-    dst.write(unsafe {
-        std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, bf16_bytes)
-    });
+    dst.zero();
+
+    let kernel = runtime.ensure_kernel_blockdsl("f32_to_bf16_pad", || build_f32_to_bf16_padded())?;
+    let grid = f32_to_bf16_grid(rows as u32);  // only dispatch for real rows, padded rows stay zero
+    let ka = crate::kernargs![
+        src.gpu_addr() => u64,
+        dst.gpu_addr() => u64,
+        cols as u32 => u32,
+        cols_padded as u32 => u32
+    ];
+    runtime.dispatch(&kernel, [grid, 1, 1], &ka)?;
     Ok(dst)
 }
 
 /// Convert f32 [rows, cols] → bf16 [cols_padded, rows_padded] transposed with padding.
-/// CPU path (GPU transpose causes hang with large matrices — needs investigation).
+/// GPU path with epl loop for dim > WG_SIZE.
 #[cfg(feature = "rocm")]
 fn f32_to_bf16_transpose_gpu_padded(
     runtime: &Arc<GpuRuntime>,
@@ -434,27 +429,22 @@ fn f32_to_bf16_transpose_gpu_padded(
     rows: usize, cols: usize,
     cols_padded: usize, rows_padded: usize,
 ) -> Result<GpuBuffer, String> {
-    let n = rows * cols;
-    let mut f32_data = vec![0f32; n];
-    src.read(unsafe {
-        std::slice::from_raw_parts_mut(f32_data.as_mut_ptr() as *mut u8, n * 4)
-    });
+    use crate::t0::elementwise_kernels::{build_f32_to_bf16_transpose_padded, f32_to_bf16_grid};
 
-    let n_padded = cols_padded * rows_padded;
-    let mut bf16_data = vec![0u16; n_padded];
-    for r in 0..rows {
-        for c in 0..cols {
-            let bits = f32_data[r * cols + c].to_bits();
-            let bf16 = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16;
-            bf16_data[c * rows_padded + r] = bf16;
-        }
-    }
+    let bf16_bytes = cols_padded * rows_padded * 2;
+    let alloc_bytes = (bf16_bytes + 255) & !255;
+    let dst = runtime.alloc(alloc_bytes)?;
+    dst.zero();
 
-    let bf16_bytes = ((n_padded * 2) + 255) & !255;
-    let dst = runtime.alloc(bf16_bytes)?;
-    dst.write(unsafe {
-        std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, n_padded * 2)
-    });
+    let kernel = runtime.ensure_kernel_blockdsl("f32_to_bf16_tp", || build_f32_to_bf16_transpose_padded())?;
+    let grid = f32_to_bf16_grid(rows as u32);
+    let ka = crate::kernargs![
+        src.gpu_addr() => u64,
+        dst.gpu_addr() => u64,
+        cols as u32 => u32,
+        rows_padded as u32 => u32
+    ];
+    runtime.dispatch(&kernel, [grid, 1, 1], &ka)?;
     Ok(dst)
 }
 

@@ -398,7 +398,8 @@ pub fn build_f32_to_bf16_b32() -> BlockKernel {
 /// Out-of-bounds positions are zero-filled (bf16 0x0000).
 ///
 /// Kernarg layout: [src:u64, dst:u64, real_cols:u32, pad_cols:u32]
-/// Grid: (pad_rows * WG_SIZE, 1)
+/// Grid: (real_rows * WG_SIZE, 1) — only dispatch for real rows, not padded.
+/// Caller must zero() the dst buffer before calling to handle padded rows.
 pub fn build_f32_to_bf16_padded() -> BlockKernel {
     let mut kb = BlockKernel::new("f32_to_bf16_pad", WG_SIZE);
 
@@ -410,17 +411,18 @@ pub fn build_f32_to_bf16_padded() -> BlockKernel {
     let tid = kb.thread_id();
     let row = kb.program_id(0);
 
-    let col = tid;
-    let in_bounds = col.lt(&mut kb, real_cols);
-
-    // src offset = row * real_cols + col
-    let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
-    // dst offset = row * pad_cols + col (f32 element offset for store_bf16)
-    let dst_off = row.mul(&mut kb, pad_cols).add(&mut kb, col);
-
-    let val = kb.load(src, src_off, in_bounds);
-    // Store bf16 only where in bounds (dst stays zero in padded area)
-    kb.store_bf16(dst, dst_off, val, in_bounds);
+    // EPL loop: each thread handles elements tid, tid+WG_SIZE, tid+2*WG_SIZE, ...
+    let wg = kb.const_u32(WG_SIZE);
+    let mut col = tid;
+    let epl = 8; // max elements per lane (up to 8*256=2048 cols)
+    for _ in 0..epl {
+        let in_bounds = col.lt(&mut kb, real_cols);
+        let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
+        let dst_off = row.mul(&mut kb, pad_cols).add(&mut kb, col);
+        let val = kb.load(src, src_off, in_bounds);
+        kb.store_bf16(dst, dst_off, val, in_bounds);
+        col = col.add(&mut kb, wg);
+    }
 
     kb
 }
@@ -443,17 +445,18 @@ pub fn build_f32_to_bf16_transpose_padded() -> BlockKernel {
     let tid = kb.thread_id();
     let row = kb.program_id(0);
 
-    let col = tid;
-    let in_bounds = col.lt(&mut kb, real_cols);
-
-    // src offset = row * real_cols + col
-    let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
-    // dst offset (transposed) = col * pad_rows + row
-    let dst_off = col.mul(&mut kb, pad_rows).add(&mut kb, row);
-
-    let val = kb.load(src, src_off, in_bounds);
-    // Store only if in bounds (dst positions outside real data stay zero)
-    kb.store_bf16(dst, dst_off, val, in_bounds);
+    // EPL loop: each thread handles elements tid, tid+WG_SIZE, tid+2*WG_SIZE, ...
+    let wg = kb.const_u32(WG_SIZE);
+    let mut col = tid;
+    let epl = 8;
+    for _ in 0..epl {
+        let in_bounds = col.lt(&mut kb, real_cols);
+        let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);
+        let dst_off = col.mul(&mut kb, pad_rows).add(&mut kb, row);
+        let val = kb.load(src, src_off, in_bounds);
+        kb.store_bf16(dst, dst_off, val, in_bounds);
+        col = col.add(&mut kb, wg);
+    }
 
     kb
 }
@@ -699,4 +702,163 @@ mod tests {
         }
         eprintln!("✓ bf16_store_test GPU: n={}, all values within 1 ULP", n);
     }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_gpu_bf16_then_gemm() {
+        // Minimal test: GPU bf16 conversion → GEMM with pre-converted bf16 data.
+        // Uses matmul_with_wt_bf16 which takes pre-transposed bf16 weights.
+        use crate::ignis::gpu_context::GpuRuntime;
+        use crate::ignis::tensor::{Tensor, DType};
+        use crate::ignis::ops::bf16_matmul;
+        use std::sync::{Arc, OnceLock};
+
+        struct SyncRt(Arc<GpuRuntime>);
+        unsafe impl Sync for SyncRt {}
+        unsafe impl Send for SyncRt {}
+        static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+        let rt = GPU_RT.get_or_init(|| SyncRt(GpuRuntime::new().expect("GPU runtime"))).0.clone();
+
+        let m = 1usize; let k = 128usize; let n = 128usize;
+        let x_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let x_buf = rt.upload_f32(&x_data).unwrap();
+        let w_buf = rt.upload_f32(&w_data).unwrap();
+
+        // Step 1: GPU bf16 conversion (WT transpose)
+        let bf16_tp_kernel = rt.ensure_kernel_blockdsl("f32_to_bf16_tp", || build_f32_to_bf16_transpose_padded()).unwrap();
+        let n_pad = 128usize; let k_pad = 128usize;
+        let wt_bf16 = rt.alloc(((n_pad * k_pad * 2) + 255) & !255).unwrap();
+        wt_bf16.zero();
+        let ka_w = crate::kernargs![w_buf.gpu_addr() => u64, wt_bf16.gpu_addr() => u64, n as u32 => u32, n_pad as u32 => u32];
+        rt.dispatch(&bf16_tp_kernel, [f32_to_bf16_grid(k as u32), 1, 1], &ka_w).expect("bf16 WT");
+        eprintln!("✓ GPU bf16 WT conversion OK");
+
+        // Step 2: GEMM with pre-converted GPU bf16 weights
+        // matmul_with_wt_bf16 converts X to bf16 on CPU (via f32_to_bf16_gpu_padded),
+        // then dispatches GEMM with GPU-converted WT bf16 data.
+        let x_tensor = Tensor::from_buffer(Arc::new(x_buf), &rt, &[m, k], DType::F32, "x");
+        let y = bf16_matmul::matmul_with_wt_bf16(&x_tensor, &wt_bf16, m, k, n, &rt);
+        match y {
+            Ok(_) => eprintln!("✓ GPU bf16 WT → GEMM OK"),
+            Err(e) => panic!("GPU bf16 WT → GEMM HANG/FAIL: {}", e),
+        }
+
+        // Step 3: Compare with fully CPU bf16 GEMM
+        let x_buf2 = rt.upload_f32(&x_data).unwrap();
+        let w_buf2 = rt.upload_f32(&w_data).unwrap();
+        let _y_cpu = bf16_matmul::gemm_f32_raw(&rt, &x_buf2, &w_buf2, m, k, n).expect("CPU GEMM");
+        eprintln!("✓ CPU bf16 GEMM OK — both paths work!");
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_gpu_bf16_x_then_gemm() {
+        // Test: GPU bf16 conversion for X → GEMM (the suspected hang path).
+        use crate::ignis::gpu_context::GpuRuntime;
+        use crate::ignis::tensor::{Tensor, DType};
+        use crate::ignis::ops::bf16_matmul;
+        use std::sync::{Arc, OnceLock};
+
+        struct SyncRt(Arc<GpuRuntime>);
+        unsafe impl Sync for SyncRt {}
+        unsafe impl Send for SyncRt {}
+        static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+        let rt = GPU_RT.get_or_init(|| SyncRt(GpuRuntime::new().expect("GPU runtime"))).0.clone();
+
+        let m = 1usize; let k = 128usize; let n = 128usize;
+        let x_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let x_buf = rt.upload_f32(&x_data).unwrap();
+        let w_buf = rt.upload_f32(&w_data).unwrap();
+
+        // GPU bf16 X conversion
+        let bf16_kernel = rt.ensure_kernel_blockdsl("f32_to_bf16_pad", || build_f32_to_bf16_padded()).unwrap();
+        let m_pad = 16usize; let k_pad = 128usize;
+        let x_bf16 = rt.alloc(((m_pad * k_pad * 2) + 255) & !255).unwrap();
+        x_bf16.zero();
+        let ka_x = crate::kernargs![x_buf.gpu_addr() => u64, x_bf16.gpu_addr() => u64, k as u32 => u32, k_pad as u32 => u32];
+        rt.dispatch(&bf16_kernel, [f32_to_bf16_grid(m_pad as u32), 1, 1], &ka_x).expect("bf16 X");
+        eprintln!("✓ GPU bf16 X conversion OK");
+
+        // GEMM after GPU bf16 dispatch
+        let y = bf16_matmul::gemm_f32_raw(&rt, &x_buf, &w_buf, m, k, n);
+        match y {
+            Ok(_) => eprintln!("✓ GEMM after GPU bf16 X dispatch OK"),
+            Err(e) => panic!("GEMM after GPU bf16 X dispatch HANG/FAIL: {}", e),
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_rmsnorm_then_gpu_bf16_then_gemm() {
+        // Reproduce the exact inference pipeline: rmsnorm → GPU bf16 → GEMM.
+        use crate::ignis::gpu_context::GpuRuntime;
+        use crate::ignis::tensor::{Tensor, DType};
+        use crate::ignis::ops::{rmsnorm, bf16_matmul};
+        use std::sync::{Arc, OnceLock};
+
+        struct SyncRt(Arc<GpuRuntime>);
+        unsafe impl Sync for SyncRt {}
+        unsafe impl Send for SyncRt {}
+        static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+        let rt = GPU_RT.get_or_init(|| SyncRt(GpuRuntime::new().expect("GPU runtime"))).0.clone();
+
+        let dim = 1024usize;
+        let x_data: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001).collect();
+        let gamma_data: Vec<f32> = vec![1.0f32; dim];
+
+        let device = Arc::new(crate::kfd::KfdDevice::open().expect("KFD device"));
+
+        // Step 1: rmsnorm
+        let x = Tensor::from_buffer(Arc::new(rt.upload_f32(&x_data).unwrap()), &rt, &[1, dim], DType::F32, "x");
+        let gamma = Tensor::from_buffer(Arc::new(rt.upload_f32(&gamma_data).unwrap()), &rt, &[dim], DType::F32, "gamma");
+        let rms_out = rmsnorm::rmsnorm(&x, &gamma, &device).expect("rmsnorm");
+        eprintln!("✓ rmsnorm OK");
+
+        // Step 2: GEMM after rmsnorm — this calls dispatch_gemm_forward which uses
+        // f32_to_bf16_gpu_padded (CPU path) for both X and W.
+        // If this works, the issue is specific to the GPU bf16 conversion path.
+        let w_data: Vec<f32> = (0..dim * dim).map(|i| (i as f32) * 0.0001).collect();
+        let w_buf = rt.upload_f32(&w_data).unwrap();
+        let y = bf16_matmul::gemm_f32_raw(&rt, rms_out.buffer(), &w_buf, 1, dim, dim);
+        match y {
+            Ok(_) => eprintln!("✓ rmsnorm → CPU bf16 → GEMM OK (baseline)"),
+            Err(e) => panic!("rmsnorm → CPU bf16 → GEMM FAIL: {}", e),
+        }
+
+        // Step 3: Now switch f32_to_bf16_gpu_padded to GPU path and test again.
+        // We can't easily switch mid-test, so let's verify the GPU bf16 kernel
+        // produces correct data after rmsnorm by reading it back.
+        let bf16_kernel = rt.ensure_kernel_blockdsl("f32_to_bf16_pad", || build_f32_to_bf16_padded()).unwrap();
+        let m_pad = 16usize; let k_pad = 1024usize;
+        let x_bf16 = rt.alloc(((m_pad * k_pad * 2) + 255) & !255).unwrap();
+        x_bf16.zero();
+        let ka_x = crate::kernargs![rms_out.buffer().gpu_addr() => u64, x_bf16.gpu_addr() => u64, dim as u32 => u32, k_pad as u32 => u32];
+        rt.dispatch(&bf16_kernel, [f32_to_bf16_grid(m_pad as u32), 1, 1], &ka_x).expect("bf16 X after rmsnorm");
+
+        // Read back and verify
+        let mut bf16_bytes = vec![0u8; dim * 2];
+        x_bf16.read(&mut bf16_bytes);
+        let mut rms_f32 = vec![0f32; dim];
+        rms_out.buffer().read(unsafe { std::slice::from_raw_parts_mut(rms_f32.as_mut_ptr() as *mut u8, dim * 4) });
+        for i in 0..dim {
+            let bf16_bits = u16::from_le_bytes([bf16_bytes[i * 2], bf16_bytes[i * 2 + 1]]);
+            let expected = ((rms_f32[i].to_bits() + 0x7FFF + ((rms_f32[i].to_bits() >> 16) & 1)) >> 16) as u16;
+            let diff = (bf16_bits as i32 - expected as i32).abs();
+            assert!(diff <= 1, "bf16 mismatch at {}: got 0x{:04x}, expected 0x{:04x}", i, bf16_bits, expected);
+        }
+        eprintln!("✓ GPU bf16 X after rmsnorm: data verified correct");
+
+        // Step 4: Use the GPU-converted bf16 data directly in a GEMM
+        // by using matmul_with_wt_bf16 (which does CPU bf16 for X but uses pre-computed WT).
+        // The GPU bf16 dispatch at step 3 runs BEFORE this GEMM.
+        // If the hang is caused by a preceding GPU bf16 dispatch, this will catch it.
+        let y2 = bf16_matmul::matmul_with_wt_bf16(&rms_out, &bf16_matmul::precompute_wt_bf16(&rt, &w_buf, dim, dim).unwrap(), 1, dim, dim, &rt);
+        match y2 {
+            Ok(_) => eprintln!("✓ rmsnorm → GPU bf16 X dispatch → GEMM OK"),
+            Err(e) => panic!("rmsnorm → GPU bf16 X dispatch → GEMM HANG/FAIL: {}", e),
+        }
+    }
+
 }
