@@ -71,6 +71,12 @@ impl Linear {
             cached_wt_bf16: std::sync::OnceLock::new(),
         }
     }
+
+    /// Pre-set the cached bf16 transposed weight (for fast loading).
+    /// Use this to avoid the f32→bf16 conversion on first forward pass.
+    pub fn set_cached_wt_bf16(&self, wt_bf16: crate::kfd::GpuBuffer) {
+        let _ = self.cached_wt_bf16.set(Some(wt_bf16));
+    }
 }
 
 #[cfg(feature = "rocm")]

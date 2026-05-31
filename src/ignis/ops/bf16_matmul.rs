@@ -116,6 +116,45 @@ pub fn precompute_wt_bf16(
     f32_to_bf16_transpose_gpu_padded(runtime, w_f32, k, n, n_pad, k_pad)
 }
 
+/// Pre-compute bf16 weight buffer from raw bf16 data (already transposed [N, K]).
+///
+/// This is the fast path for loading bf16 weights from safetensors —
+/// avoids the bf16→f32→bf16 double conversion.
+/// Input: bf16 buffer [N, K] (row-major, no padding)
+/// Output: bf16 buffer [N_pad, K_pad] (row-major, with zero padding)
+#[cfg(feature = "rocm")]
+pub fn precompute_wt_bf16_from_raw(
+    runtime: &Arc<GpuRuntime>,
+    raw_bf16: &GpuBuffer,
+    n: usize,
+    k: usize,
+) -> Result<GpuBuffer, String> {
+    use crate::t0::gemm_gen::GemmConfig;
+    let cfg = select_config(1);
+    let n_pad = pad_tile(n, cfg.tile_n);
+    let k_pad = pad_tile(k, cfg.tile_k);
+
+    // Pad: copy each row of k bf16 values into a row of k_pad bf16 values
+    let dst_bytes = n_pad * k_pad * 2;
+    let dst = runtime.alloc((dst_bytes + 255) & !255)?;
+    dst.zero();
+
+    // Read raw bf16 data
+    let src_bytes = n * k * 2;
+    let mut raw = vec![0u8; src_bytes];
+    raw_bf16.read(&mut raw);
+
+    // Write with per-row padding
+    let mut padded = vec![0u8; dst_bytes];
+    for row in 0..n {
+        let src_off = row * k * 2;
+        let dst_off = row * k_pad * 2;
+        padded[dst_off..dst_off + k * 2].copy_from_slice(&raw[src_off..src_off + k * 2]);
+    }
+    dst.write(&padded);
+    Ok(dst)
+}
+
 /// MatMul with pre-transposed bf16 weight (for inference/repeated forward).
 #[cfg(feature = "rocm")]
 pub fn matmul_with_wt_bf16(

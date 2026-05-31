@@ -416,33 +416,59 @@ pub fn load_qwen3_into_model(
         return Err("missing model.embed_tokens.weight".to_string());
     }
 
-    // Assign layer weights
+    // Assign layer weights — fast path: keep bf16, pad directly, skip f32 intermediate
     for (layer_idx, layer) in model.layers.iter_mut().enumerate() {
         let prefix = format!("model.layers.{}", layer_idx);
 
-        // Attention projections — transpose from HF [out, in] to our [in, out]
-        if let Some(w) = all_tensors.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
-            layer.wq.weight = transpose_bf16(w, runtime);
-        }
-        if let Some(w) = all_tensors.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
-            layer.wk.weight = transpose_bf16(w, runtime);
-        }
-        if let Some(w) = all_tensors.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
-            layer.wv.weight = transpose_bf16(w, runtime);
-        }
-        if let Some(w) = all_tensors.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
-            layer.wo.weight = transpose_bf16(w, runtime);
+        // Helper: load bf16 weight, pre-compute padded bf16, set f32 weight + cache
+        fn assign_weight_fast(
+            layer_linear: &mut crate::ignis::nn::linear::Linear,
+            bf16_tensor: &crate::ignis::tensor::Tensor,
+            runtime: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
+        ) -> Result<(), String> {
+            // bf16_tensor is [N, K] bf16 from safetensors (HF format: [out, in])
+            // We need: f32 weight [K, N] for backward/other uses
+            //          bf16 padded [N_pad, K_pad] for GEMM
+            let shape = bf16_tensor.shape();
+            let n = shape[0]; // out_features
+            let k = shape[1]; // in_features
+
+            // Convert bf16→f32 for the weight tensor (needed for non-GEMM paths)
+            layer_linear.weight = transpose_bf16(bf16_tensor, runtime);
+
+            // Pre-compute bf16 padded weight directly from raw bf16
+            // bf16_tensor is [N, K] — this is already transposed relative to our [K, N] layout
+            // So we just need to pad it, not transpose
+            let wt_bf16 = crate::ignis::ops::bf16_matmul::precompute_wt_bf16_from_raw(
+                runtime, bf16_tensor.buffer(), n, k,
+            )?;
+            layer_linear.set_cached_wt_bf16(wt_bf16);
+            Ok(())
         }
 
-        // FFN projections — transpose from HF [out, in] to our [in, out]
+        // Attention projections
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+            assign_weight_fast(&mut layer.wq, w, runtime)?;
+        }
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+            assign_weight_fast(&mut layer.wk, w, runtime)?;
+        }
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+            assign_weight_fast(&mut layer.wv, w, runtime)?;
+        }
+        if let Some(w) = all_tensors.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+            assign_weight_fast(&mut layer.wo, w, runtime)?;
+        }
+
+        // FFN projections
         if let Some(w) = all_tensors.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
-            layer.w_gate.weight = transpose_bf16(w, runtime);
+            assign_weight_fast(&mut layer.w_gate, w, runtime)?;
         }
         if let Some(w) = all_tensors.get(&format!("{}.mlp.up_proj.weight", prefix)) {
-            layer.w_up.weight = transpose_bf16(w, runtime);
+            assign_weight_fast(&mut layer.w_up, w, runtime)?;
         }
         if let Some(w) = all_tensors.get(&format!("{}.mlp.down_proj.weight", prefix)) {
-            layer.w_down.weight = transpose_bf16(w, runtime);
+            assign_weight_fast(&mut layer.w_down, w, runtime)?;
         }
 
         // RMSNorm gammas
