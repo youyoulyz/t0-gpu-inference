@@ -112,6 +112,11 @@ pub struct KvSlice {
 
 #[cfg(feature = "rocm")]
 impl KvCache {
+    /// GPU base address of the KV cache buffer.
+    pub fn buf_gpu_addr(&self) -> u64 {
+        self.buf.gpu_addr()
+    }
+
     /// Create a new KV cache with pre-allocated VRAM.
     ///
     /// # Arguments
@@ -187,6 +192,18 @@ impl KvCache {
         value: &Tensor,
     ) -> Result<(), String> {
         let pos = self.position.load(Ordering::Acquire) as usize;
+        self.append_at(runtime, layer, pos, key, value)
+    }
+
+    /// Append K/V at an explicit position (for per-layer position control).
+    pub fn append_at_pos(
+        &self,
+        runtime: &Arc<GpuRuntime>,
+        layer: usize,
+        pos: usize,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<(), String> {
         self.append_at(runtime, layer, pos, key, value)
     }
 

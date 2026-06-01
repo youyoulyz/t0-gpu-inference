@@ -245,7 +245,7 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
-        let dbg = layer_idx == 0;
+        let dbg = false; // set to true for layer 0 debugging
         let norm = |t: &Tensor| -> f32 { t.to_f32_vec().iter().map(|v| v*v).sum::<f32>().sqrt() };
 
         // === Attention sub-layer ===
@@ -281,20 +281,22 @@ impl TransformerLayer {
         let k_3d = k.reshape(&[seq_len, kv_heads, hd]);
         let v_3d = v.reshape(&[seq_len, kv_heads, hd]);
 
+        // Write K/V at the current position (same for all layers, advance once after all layers)
+        let write_pos = kv_cache.position();
         if seq_len == 1 {
-            kv_cache.append(&self.runtime, layer_idx, &k_3d, &v_3d)?;
-            kv_cache.advance();
+            kv_cache.append_at_pos(&self.runtime, layer_idx, write_pos, &k_3d, &v_3d)?;
         } else {
             kv_cache.append_many(&self.runtime, layer_idx, &k_3d, &v_3d)?;
-            kv_cache.advance_by(seq_len);
         }
 
-        // Zero-copy: create Tensors directly from KV cache GPU addresses
-        let kv_len = kv_cache.position();
-        let k_slice = kv_cache.get_k(layer_idx);
-        let v_slice = kv_cache.get_v(layer_idx);
-        let k_cache = Tensor::from_gpu_addr(k_slice.gpu_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
-        let v_cache = Tensor::from_gpu_addr(v_slice.gpu_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
+        // KV length includes the newly appended tokens
+        let kv_len = write_pos + seq_len;
+        // Get GPU addresses directly (bypass get_k/get_v which assert pos > 0)
+        let k_addr = kv_cache.buf_gpu_addr() + kv_cache.k_offset(layer_idx, 0) as u64;
+        let v_addr = kv_cache.buf_gpu_addr() + kv_cache.v_offset(layer_idx, 0) as u64;
+
+        let k_cache = Tensor::from_gpu_addr(k_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
+        let v_cache = Tensor::from_gpu_addr(v_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
 
         // Standard scaled dot-product attention with GQA
         let attn_out = ops::attention::standard_attention(
