@@ -58,6 +58,38 @@ fn main() {
     let prompt_ids = tokenizer.encode(&args.prompt);
     eprintln!("  Prompt tokens: {} ({:?})", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
 
+    // Debug: run prefill and check logits
+    {
+        use t0_gpu::ignis::kv_cache::KvCacheConfig;
+        let kv_config = KvCacheConfig {
+            num_layers: model.config.num_layers,
+            num_kv_heads: model.config.num_key_value_heads,
+            head_dim: model.config.head_dim,
+            max_seq_len: args.max_seq_len,
+        };
+        let mut debug_kv = t0_gpu::ignis::kv_cache::KvCache::new(&runtime, kv_config).unwrap();
+        let logits = model.forward_prefill(&prompt_ids, &mut debug_kv).unwrap();
+        let logits_data = logits.to_f32_vec();
+        let vocab_size = logits_data.len();
+        // Find top-10 tokens
+        let mut indexed: Vec<(usize, f32)> = logits_data.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        eprintln!("  Top-10 logits (vocab={} indexed_len={}):", vocab_size, indexed.len());
+        // Print first 5 raw logits to verify data
+        eprintln!("  Raw logits[0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
+            logits_data[0], logits_data[1], logits_data[2], logits_data[3], logits_data[4]);
+        for rank in 0..10.min(indexed.len()) {
+            let id = indexed[rank].0;
+            let val = indexed[rank].1;
+            eprintln!("    rank={}: id={} logit={:.4}", rank, id, val);
+        }
+        // Stats
+        let max_logit = indexed[0].1;
+        let min_logit = indexed.last().unwrap().1;
+        let mean_logit: f32 = logits_data.iter().sum::<f32>() / vocab_size as f32;
+        eprintln!("  Logit stats: max={:.4} min={:.4} mean={:.4} vocab={}", max_logit, min_logit, mean_logit, vocab_size);
+    }
+
     let eos_id = 151645u32; // Qwen3 EOS token
 
     let start = std::time::Instant::now();

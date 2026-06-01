@@ -151,6 +151,23 @@ pub fn standard_attention(
         )?;
         let t_gemm = t1.elapsed();
 
+        // Debug: check Q@K^T values for head 0
+        if h == 0 && seq_len == 1 {
+            let mut qk_data = vec![0f32; seq_len * kv_len];
+            gemm_out.read(unsafe { std::slice::from_raw_parts_mut(qk_data.as_mut_ptr() as *mut u8, seq_len * kv_len * 4) });
+            eprintln!("    [attn h=0] Q@K^T raw: max={:.4} min={:.4} mean={:.4}",
+                qk_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                qk_data.iter().cloned().fold(f32::INFINITY, f32::min),
+                qk_data.iter().sum::<f32>() / qk_data.len() as f32);
+
+            // Debug: check V_head buffer
+            let mut v_data = vec![0f32; kv_len * head_dim];
+            v_head_buf.read(unsafe { std::slice::from_raw_parts_mut(v_data.as_mut_ptr() as *mut u8, kv_len * head_dim * 4) });
+            let v_norm: f32 = v_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("    [attn h=0] V_head: norm={:.4} first5={:.4} {:.4} {:.4} {:.4} {:.4}",
+                v_norm, v_data[0], v_data[1], v_data[2], v_data[3], v_data[4]);
+        }
+
         // Step 6: GPU scale + causal mask
         let t2 = std::time::Instant::now();
         let ka = crate::kernargs![
@@ -162,6 +179,16 @@ pub fn standard_attention(
         let (gx, _) = ak::attn_scale_grid(seq_len as u32);
         runtime.dispatch(&scale_kernel, [gx, 1, 1], &ka)?;
         let t_scale = t2.elapsed();
+
+        // Debug: check scaled scores for head 0
+        if h == 0 && seq_len == 1 {
+            let mut sc_data = vec![0f32; seq_len * kv_len];
+            scores_buf.read(unsafe { std::slice::from_raw_parts_mut(sc_data.as_mut_ptr() as *mut u8, seq_len * kv_len * 4) });
+            eprintln!("    [attn h=0] scaled: max={:.4} min={:.4} mean={:.4}",
+                sc_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                sc_data.iter().cloned().fold(f32::INFINITY, f32::min),
+                sc_data.iter().sum::<f32>() / sc_data.len() as f32);
+        }
 
         // Step 7: GPU softmax
         let t3 = std::time::Instant::now();
@@ -197,12 +224,31 @@ pub fn standard_attention(
         };
         let t_softmax = t3.elapsed();
 
+        // Debug: check softmax weights and weights@V output for head 0
+        if h == 0 && seq_len == 1 {
+            let mut w_data = vec![0f32; seq_len * kv_len];
+            weights_buf.read(unsafe { std::slice::from_raw_parts_mut(w_data.as_mut_ptr() as *mut u8, seq_len * kv_len * 4) });
+            eprintln!("    [attn h=0] softmax: sum={:.4} max={:.4} first={:.4}",
+                w_data.iter().sum::<f32>(),
+                w_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                w_data[0]);
+        }
+
         // Step 8: GPU GEMM out_head = weights @ V_head → [seq_len, head_dim]
         let t4 = std::time::Instant::now();
         let out_head_buf = super::super::ops::bf16_matmul::gemm_f32_raw(
             runtime, &weights_buf, &v_head_buf, seq_len, kv_len, head_dim,
         )?;
         let t_gemm2 = t4.elapsed();
+
+        // Debug: check weights@V output for head 0
+        if h == 0 && seq_len == 1 {
+            let mut out_data = vec![0f32; seq_len * head_dim];
+            out_head_buf.read(unsafe { std::slice::from_raw_parts_mut(out_data.as_mut_ptr() as *mut u8, seq_len * head_dim * 4) });
+            let out_norm: f32 = out_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("    [attn h=0] weights@V: norm={:.4} first5={:.4} {:.4} {:.4} {:.4} {:.4}",
+                out_norm, out_data[0], out_data[1], out_data[2], out_data[3], out_data[4]);
+        }
 
         // Step 9: GPU scatter out_head → out_buf at position h
         let t5 = std::time::Instant::now();
@@ -222,6 +268,22 @@ pub fn standard_attention(
             h, t_gather.as_secs_f64()*1000.0, t_gemm.as_secs_f64()*1000.0,
             t_scale.as_secs_f64()*1000.0, t_softmax.as_secs_f64()*1000.0,
             t_gemm2.as_secs_f64()*1000.0, t_scatter.as_secs_f64()*1000.0);
+    }
+
+    // Debug: verify combined output
+    if seq_len == 1 {
+        let mut out_data = vec![0f32; seq_len * n_heads * head_dim];
+        out_buf.read(unsafe { std::slice::from_raw_parts_mut(out_data.as_mut_ptr() as *mut u8, seq_len * n_heads * head_dim * 4) });
+        let total_norm: f32 = out_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+        // Per-head norms
+        let mut head_norms = Vec::new();
+        for hi in 0..n_heads {
+            let start = hi * head_dim;
+            let hn: f32 = out_data[start..start+head_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
+            head_norms.push(hn);
+        }
+        eprintln!("    [attn] combined: norm={:.4} heads: {:?}", total_norm,
+            head_norms.iter().enumerate().map(|(i,n)| format!("{}={:.3}", i, n)).collect::<Vec<_>>().join(" "));
     }
 
     Ok(Tensor::from_buffer(Arc::new(out_buf), runtime,

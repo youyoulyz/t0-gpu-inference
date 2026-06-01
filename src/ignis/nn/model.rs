@@ -160,9 +160,26 @@ impl LanguageModel {
         // Embed all tokens at once via CPU (reads weight table once)
         let mut h = self.embedding.forward_cpu(ids)?;
 
+        // Debug: check embedding norm
+        {
+            let d = h.to_f32_vec();
+            let norm: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("[Prefill] embed: norm={:.4} dim={}", norm, d.len());
+        }
+
         // Run through all transformer layers with KV cache
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward_inference(&h, 0, layer_idx, kv_cache)?;
+            // Debug: check layer output norm for first and last layer
+            if layer_idx == 0 || layer_idx == self.layers.len() - 1 {
+                let d = h.to_f32_vec();
+                let norm: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("[Prefill] layer_{}: norm={:.4}", layer_idx, norm);
+                if layer_idx == 0 {
+                    eprintln!("[Prefill] layer_0 first10: {:?}", &d[..10]);
+                    eprintln!("[Prefill] layer_0 last10: {:?}", &d[d.len()-10..]);
+                }
+            }
         }
 
         // Final RMSNorm
@@ -202,6 +219,16 @@ impl LanguageModel {
 
         // Final RMSNorm
         h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
+
+        // Debug: check hidden state after all layers
+        {
+            let h_data = h.to_f32_vec();
+            let h_norm: f32 = h_data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let h_mean: f32 = h_data.iter().sum::<f32>() / h_data.len() as f32;
+            let has_nan = h_data.iter().any(|x| x.is_nan());
+            eprintln!("[Decode pos={}] after_all_layers: norm={:.4} mean={:.6} nan={} dim={}",
+                pos, h_norm, h_mean, has_nan, h_data.len());
+        }
 
         // LM head → logits [1, vocab_size]
         self.lm_head.forward(&h)

@@ -245,18 +245,26 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
+        let dbg = layer_idx == 0;
+        let norm = |t: &Tensor| -> f32 { t.to_f32_vec().iter().map(|v| v*v).sum::<f32>().sqrt() };
 
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
+        if dbg {
+            let d = h.to_f32_vec();
+            eprintln!("  [L{}] h_norm: {:.4} first5: {:.4} {:.4} {:.4} {:.4} {:.4}", layer_idx, norm(&h), d[0], d[1], d[2], d[3], d[4]);
+        }
 
         // Q/K/V projections
         let q = self.wq.forward(&h)?;  // [seq, q_dim]
         let k = self.wk.forward(&h)?;  // [seq, kv_dim]
         let v = self.wv.forward(&h)?;  // [seq, kv_dim]
+        if dbg { eprintln!("  [L{}] Q={:.4} K={:.4} V={:.4}", layer_idx, norm(&q), norm(&k), norm(&v)); }
 
         // QK-norm: per-head RMSNorm on Q and K
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
+        if dbg { eprintln!("  [L{}] Q_qknorm={:.4} K_qknorm={:.4}", layer_idx, norm(&q), norm(&k)); }
 
         // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
         let q_2d = q.reshape(&[seq_len * self.n_heads, self.d_head]);
@@ -265,6 +273,7 @@ impl TransformerLayer {
         let k_2d = ops::rope::rope_forward(&k_2d, pos, self.rope_theta, &self.runtime)?;
         let q = q_2d.reshape(&[seq_len, self.q_dim]);
         let k = k_2d.reshape(&[seq_len, self.kv_dim]);
+        if dbg { eprintln!("  [L{}] Q_rope={:.4} K_rope={:.4}", layer_idx, norm(&q), norm(&k)); }
 
         // Store K/V in cache
         let kv_heads = self.n_kv_heads;
@@ -293,19 +302,69 @@ impl TransformerLayer {
             self.n_heads, self.n_kv_heads, self.d_head,
             &self.runtime,
         )?;
+        if dbg { eprintln!("  [L{}] attn_out={:.4}", layer_idx, norm(&attn_out)); }
 
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
+        if dbg {
+            let d = proj_out.to_f32_vec();
+            eprintln!("  [L{}] proj_out={:.4} first5: {:.4} {:.4} {:.4} {:.4} {:.4}", layer_idx, norm(&proj_out), d[0], d[1], d[2], d[3], d[4]);
+        }
         let x2 = ops::add::add(x, &proj_out, device)?;
+        if dbg {
+            let d = x2.to_f32_vec();
+            eprintln!("  [L{}] x2 (residual)={:.4} first5: {:.4} {:.4} {:.4} {:.4} {:.4}", layer_idx, norm(&x2), d[0], d[1], d[2], d[3], d[4]);
+        }
 
         // === FFN sub-layer ===
         let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
         let gate = self.w_gate.forward(&h2)?;
         let up = self.w_up.forward(&h2)?;
+        if dbg {
+            eprintln!("  [L{}] h2={:.4} gate={:.4} up={:.4}", layer_idx, norm(&h2), norm(&gate), norm(&up));
+            let gd = gate.to_f32_vec();
+            let ud = up.to_f32_vec();
+            eprintln!("  [L{}] gate first3: {:.4} {:.4} {:.4}  up first3: {:.4} {:.4} {:.4}",
+                layer_idx, gd[0], gd[1], gd[2], ud[0], ud[1], ud[2]);
+        }
         let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-        let ffn_out = self.w_down.forward(&silu_out)?;
+        if dbg {
+            eprintln!("  [L{}] silu_out={:.4}", layer_idx, norm(&silu_out));
+            let sd = silu_out.to_f32_vec();
+            eprintln!("  [L{}] silu first3: {:.4} {:.4} {:.4}", layer_idx, sd[0], sd[1], sd[2]);
 
-        ops::add::add(&x2, &ffn_out, device)
+            // CPU reference: down_proj = silu_out @ down_weight.T
+            let sw = self.w_down.weight.to_f32_vec();
+            let in_f = self.w_down.in_features;
+            let out_f = self.w_down.out_features;
+            let mut cpu_out = vec![0f32; out_f];
+            for j in 0..out_f {
+                let mut sum = 0.0f32;
+                for i in 0..in_f {
+                    sum += sd[i] * sw[i * out_f + j];
+                }
+                cpu_out[j] = sum;
+            }
+            let cpu_norm: f32 = cpu_out.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("  [L{}] CPU down_proj: norm={:.4} first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
+                layer_idx, cpu_norm, cpu_out[0], cpu_out[1], cpu_out[2], cpu_out[3], cpu_out[4]);
+
+            // Verify: check the f32 weight values directly
+            eprintln!("  [L{}] down_weight[0,0..3]: {:.6} {:.6} {:.6} (first row of [in={}, out={}])",
+                layer_idx, sw[0], sw[1], sw[2], in_f, out_f);
+            eprintln!("  [L{}] down_weight[0..2,0]: {:.6} {:.6} {:.6} (first col)",
+                layer_idx, sw[0], sw[out_f], sw[2*out_f]);
+        }
+        let ffn_out = self.w_down.forward(&silu_out)?;
+        if dbg {
+            eprintln!("  [L{}] ffn_out={:.4}", layer_idx, norm(&ffn_out));
+            let fd = ffn_out.to_f32_vec();
+            eprintln!("  [L{}] ffn first5: {:.4} {:.4} {:.4} {:.4} {:.4}", layer_idx, fd[0], fd[1], fd[2], fd[3], fd[4]);
+        }
+
+        let result = ops::add::add(&x2, &ffn_out, device)?;
+        if dbg { eprintln!("  [L{}] final={:.4}", layer_idx, norm(&result)); }
+        Ok(result)
     }
 }
 
