@@ -436,13 +436,10 @@ pub fn load_qwen3_into_model(
             // Convert bf16→f32 for the weight tensor (needed for non-GEMM paths)
             layer_linear.weight = transpose_bf16(bf16_tensor, runtime);
 
-            // Pre-compute bf16 padded weight directly from raw bf16
-            // bf16_tensor is [N, K] — this is already transposed relative to our [K, N] layout
-            // So we just need to pad it, not transpose
-            let wt_bf16 = crate::ignis::ops::bf16_matmul::precompute_wt_bf16_from_raw(
-                runtime, bf16_tensor.buffer(), n, k,
-            )?;
-            layer_linear.set_cached_wt_bf16(wt_bf16);
+            // Note: bf16 weight cache is computed lazily in Linear::forward()
+            // via precompute_wt_bf16 (which correctly transposes [K,N]→[N,K]).
+            // precompute_wt_bf16_from_raw was removed because it doesn't transpose,
+            // causing incorrect GEMM results.
             Ok(())
         }
 

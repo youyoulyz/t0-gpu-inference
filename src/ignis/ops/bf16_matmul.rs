@@ -98,6 +98,34 @@ pub fn matmul(x: &Tensor, w: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor
     Ok(output)
 }
 
+/// Matrix multiply with transposed weight: Y = X @ W^T
+///
+/// Weight is in HuggingFace format [out_features, in_features] = [N, K].
+/// Computes Y[M, N] = X[M, K] @ W^T[K, N].
+#[cfg(feature = "rocm")]
+pub fn matmul_transposed(x: &Tensor, w: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    crate::profile_scope!("matmul_transposed");
+    let x_shape = x.shape();
+    let w_shape = w.shape();
+    assert_eq!(x_shape.len(), 2, "matmul_transposed: X must be 2D");
+    assert_eq!(w_shape.len(), 2, "matmul_transposed: W must be 2D");
+
+    let m = x_shape[0];
+    let k = x_shape[1];
+    let n = w_shape[0]; // out_features (first dim of [N, K])
+    assert_eq!(w_shape[1], k, "matmul_transposed: W[1]={} != X[1]={}", w_shape[1], k);
+
+    let runtime = x.runtime().clone();
+    let y_buf = dispatch_gemm_forward(&runtime, x.buffer(), w.buffer(), m, k, n)?;
+
+    let y_arc = Arc::new(y_buf);
+    let mut output = Tensor::from_buffer(y_arc, &runtime, &[m, n], DType::F32, "matmul_t_out");
+    if x.requires_grad() || w.requires_grad() {
+        output.set_requires_grad(true);
+    }
+    Ok(output)
+}
+
 /// Pre-compute bf16 transposed weight buffer [N, K] from f32 weight [K, N].
 ///
 /// Call once during initialization, cache the result, and pass to

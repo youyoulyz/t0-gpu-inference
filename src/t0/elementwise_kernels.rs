@@ -414,7 +414,7 @@ pub fn build_f32_to_bf16_padded() -> BlockKernel {
     // EPL loop: each thread handles elements tid, tid+WG_SIZE, tid+2*WG_SIZE, ...
     let wg = kb.const_u32(WG_SIZE);
     let mut col = tid;
-    let epl = 8; // max elements per lane (up to 8*256=2048 cols)
+    let epl = 16; // max elements per lane (up to 16*256=4096 cols)
     for _ in 0..epl {
         let in_bounds = col.lt(&mut kb, real_cols);
         let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);

@@ -330,34 +330,12 @@ impl TransformerLayer {
                 layer_idx, gd[0], gd[1], gd[2], ud[0], ud[1], ud[2]);
         }
         let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+
         if dbg {
             eprintln!("  [L{}] silu_out={:.4}", layer_idx, norm(&silu_out));
-            let sd = silu_out.to_f32_vec();
-            eprintln!("  [L{}] silu first3: {:.4} {:.4} {:.4}", layer_idx, sd[0], sd[1], sd[2]);
-
-            // CPU reference: down_proj = silu_out @ down_weight.T
-            let sw = self.w_down.weight.to_f32_vec();
-            let in_f = self.w_down.in_features;
-            let out_f = self.w_down.out_features;
-            let mut cpu_out = vec![0f32; out_f];
-            for j in 0..out_f {
-                let mut sum = 0.0f32;
-                for i in 0..in_f {
-                    sum += sd[i] * sw[i * out_f + j];
-                }
-                cpu_out[j] = sum;
-            }
-            let cpu_norm: f32 = cpu_out.iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("  [L{}] CPU down_proj: norm={:.4} first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                layer_idx, cpu_norm, cpu_out[0], cpu_out[1], cpu_out[2], cpu_out[3], cpu_out[4]);
-
-            // Verify: check the f32 weight values directly
-            eprintln!("  [L{}] down_weight[0,0..3]: {:.6} {:.6} {:.6} (first row of [in={}, out={}])",
-                layer_idx, sw[0], sw[1], sw[2], in_f, out_f);
-            eprintln!("  [L{}] down_weight[0..2,0]: {:.6} {:.6} {:.6} (first col)",
-                layer_idx, sw[0], sw[out_f], sw[2*out_f]);
         }
         let ffn_out = self.w_down.forward(&silu_out)?;
+
         if dbg {
             eprintln!("  [L{}] ffn_out={:.4}", layer_idx, norm(&ffn_out));
             let fd = ffn_out.to_f32_vec();
