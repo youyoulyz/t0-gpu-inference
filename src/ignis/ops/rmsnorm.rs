@@ -15,15 +15,21 @@ use super::super::tensor::Tensor;
 #[cfg(feature = "rocm")]
 use super::super::tape::Tape;
 
-const EPSILON: f32 = 1e-5;
+const DEFAULT_EPSILON: f32 = 1e-6;
 
 /// RMSNorm forward: y = (x / rms(x)) * gamma
 ///
 /// - x: [rows, dim] f32
 /// - gamma: [dim] f32 (per-channel scale)
-/// - output: [rows, dim] f32
+/// - eps: epsilon for numerical stability (default 1e-6 for Qwen3)
 #[cfg(feature = "rocm")]
 pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    rmsnorm_eps(x, gamma, _device, DEFAULT_EPSILON)
+}
+
+/// RMSNorm forward with explicit epsilon.
+#[cfg(feature = "rocm")]
+pub fn rmsnorm_eps(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>, eps: f32) -> Result<Tensor, String> {
     crate::profile_scope!("rmsnorm");
     crate::profiler::set_shapes(
         vec![crate::profiler::ShapeInfo::new(x.shape())],
@@ -58,7 +64,8 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
 
     // Build or reuse kernel
     let kernel = {
-        let name = format!("bdsl_rmsnorm_d{}_wg{}_v4", dim, wg_size);
+        let eps_bits = eps.to_bits();
+        let name = format!("bdsl_rmsnorm_d{}_wg{}_e{}", dim, wg_size, eps_bits);
         let cached = runtime.get_kernel(&name);
         if let Some(k) = cached {
             k
@@ -106,7 +113,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
             let dim_f = dim_arg.to_f32(&mut kb);
             let inv_dim = dim_f.rcp(&mut kb);
             let mean_sq = sum_sq.mul(&mut kb, inv_dim);
-            let eps = kb.const_f32(EPSILON);
+            let eps = kb.const_f32(eps);
             let rms = mean_sq.add(&mut kb, eps).sqrt(&mut kb);
             let inv_rms = rms.rcp(&mut kb);
 

@@ -259,6 +259,12 @@ impl LanguageModel {
             let logits = self.forward_decode(next_token, pos, kv_cache)?;
             let decode_ms = t0.elapsed().as_millis();
 
+            // Debug: show top token and logit stats
+            let logits_data = logits.to_f32_vec();
+            let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let mean_logit: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
+
             let next_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
             generated.push(next_token);
 
@@ -267,7 +273,8 @@ impl LanguageModel {
                 break;
             }
 
-            eprint!("[tok {}] {}ms  ", step + 1, decode_ms);
+            eprint!("[tok {}] {}ms id={} max_id={} max={:.2} mean={:.2}  ",
+                step + 1, decode_ms, next_token, max_idx, max_logit, mean_logit);
             if (step + 1) % 5 == 0 { eprintln!(); }
         }
         eprintln!("[Generate] Done. {} tokens generated.", generated.len());
