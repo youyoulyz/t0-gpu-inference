@@ -245,7 +245,7 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
-        let dbg = true; // enable per-layer debugging
+        let dbg = false;
         let norm = |t: &Tensor| -> f32 { t.to_f32_vec().iter().map(|v| v*v).sum::<f32>().sqrt() };
 
         // === Attention sub-layer ===

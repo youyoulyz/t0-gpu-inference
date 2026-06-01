@@ -116,11 +116,10 @@ pub fn precompute_wt_bf16(
     f32_to_bf16_transpose_gpu_padded(runtime, w_f32, k, n, n_pad, k_pad)
 }
 
-/// Pre-compute bf16 weight buffer from raw bf16 data (already transposed [N, K]).
+/// Pre-compute bf16 weight buffer from raw bf16 data (HuggingFace format [N, K]).
 ///
-/// This is the fast path for loading bf16 weights from safetensors —
-/// avoids the bf16→f32→bf16 double conversion.
-/// Input: bf16 buffer [N, K] (row-major, no padding)
+/// Transposes from [N, K] (HuggingFace: [out, in]) to [K, N] and pads.
+/// This matches `precompute_wt_bf16` which takes f32 [K, N] and transposes to [N, K].
 /// Output: bf16 buffer [N_pad, K_pad] (row-major, with zero padding)
 #[cfg(feature = "rocm")]
 pub fn precompute_wt_bf16_from_raw(
@@ -134,17 +133,19 @@ pub fn precompute_wt_bf16_from_raw(
     let n_pad = pad_tile(n, cfg.tile_n);
     let k_pad = pad_tile(k, cfg.tile_k);
 
-    // Pad: copy each row of k bf16 values into a row of k_pad bf16 values
+    // Transpose [N, K] → [N_pad, K_pad] (same as precompute_wt_bf16 output)
+    // The GEMM expects weight in [N, K] format where N=out_features, K=in_features.
+    // Safetensors stores [out_features, in_features] = [N, K], so we just pad.
     let dst_bytes = n_pad * k_pad * 2;
     let dst = runtime.alloc((dst_bytes + 255) & !255)?;
     dst.zero();
 
-    // Read raw bf16 data
+    // Read raw bf16 data [N, K]
     let src_bytes = n * k * 2;
     let mut raw = vec![0u8; src_bytes];
     raw_bf16.read(&mut raw);
 
-    // Write with per-row padding
+    // Write with per-row padding (no transpose — data is already [N, K])
     let mut padded = vec![0u8; dst_bytes];
     for row in 0..n {
         let src_off = row * k * 2;
