@@ -496,14 +496,26 @@ pub fn load_qwen3_into_model(
         eprintln!("[Safetensors] Assigned model.norm.weight");
     }
 
-    // LM head — transpose from HF [vocab, hidden] to our [hidden, vocab]
-    if let Some(w) = all_tensors.get("lm_head.weight") {
-        model.lm_head.weight = transpose_bf16(w, runtime);
-        eprintln!("[Safetensors] Assigned lm_head.weight");
-    } else if model.config.tie_word_embeddings {
-        // Weight tying: lm_head shares embedding weight
+    // LM head — either weight-tied or transposed
+    if model.config.tie_word_embeddings {
+        // Weight tying: lm_head shares embedding weight (HF stores as [vocab, hidden],
+        // same as embedding — no transpose needed, matmul handles it)
         model.tie_lm_head();
-        eprintln!("[Safetensors] Tied lm_head.weight → embedding.weight");
+        // Pre-compute bf16 padded weight for lm_head (same as embedding.weight)
+        // Without this, lm_head.forward() triggers a GPU f32→bf16 conversion that hangs.
+        if let Some(embed_tensor) = all_tensors.get("model.embed_tokens.weight") {
+            let n = model.config.vocab_size;
+            let k = model.config.hidden_size;
+            let wt_bf16 = crate::ignis::ops::bf16_matmul::precompute_wt_bf16_from_raw(
+                runtime, embed_tensor.buffer(), n, k,
+            )?;
+            model.lm_head.set_cached_wt_bf16(wt_bf16);
+        }
+        eprintln!("[Safetensors] Tied lm_head.weight → embedding.weight (bf16 cached)");
+    } else if let Some(w) = all_tensors.get("lm_head.weight") {
+        // No tying: transpose from HF [vocab, hidden] to our [hidden, vocab]
+        model.lm_head.weight = transpose_bf16(w, runtime);
+        eprintln!("[Safetensors] Assigned lm_head.weight (transposed)");
     }
 
     eprintln!("[Safetensors] Model weight loading complete!");

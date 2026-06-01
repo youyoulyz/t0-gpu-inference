@@ -52,13 +52,26 @@ pub fn qk_norm(
     // contiguous in memory as [seq_len * n_heads, head_dim] (row-major).
     let out_buf = runtime.alloc_f32(seq_len * n_heads * head_dim)?;
 
+    // Ensure gamma is f32 — the RMSNorm kernel reads f32 from gamma buffer.
+    // Safetensors loads weights as bf16, so we need to convert.
+    let gamma_f32 = if gamma.dtype() == super::super::tensor::DType::BF16 {
+        let data = gamma.to_f32_vec();
+        let buf = runtime.upload_f32(&data)?;
+        super::super::tensor::Tensor::from_buffer(
+            std::sync::Arc::new(buf), &runtime, gamma.shape(),
+            super::super::tensor::DType::F32, "gamma_f32"
+        )
+    } else {
+        gamma.clone()
+    };
+
     let kernel = runtime.ensure_kernel_blockdsl(&format!("rmsnorm_d{}", head_dim), || {
         crate::t0::rmsnorm_kernels::build_rmsnorm_forward()
     })?;
 
     let ka = crate::kernargs![
         x.gpu_addr() => u64,
-        gamma.gpu_addr() => u64,
+        gamma_f32.gpu_addr() => u64,
         out_buf.gpu_addr() => u64,
         head_dim as u32 => u32,
         1e-6f32 => f32  // eps

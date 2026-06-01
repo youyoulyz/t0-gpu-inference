@@ -27,7 +27,7 @@ use super::super::gpu_context::GpuRuntime;
 pub fn rope_forward(
     x: &Tensor,
     pos_offset: usize,
-    _rope_theta: f32,
+    rope_theta: f32,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
     crate::profile_scope!("rope");
@@ -44,7 +44,9 @@ pub fn rope_forward(
 
     let out_buf = runtime.alloc_f32(n_tokens * dim)?;
 
-    let kernel = runtime.ensure_kernel_blockdsl("rope_fwd", || {
+    // Cache key includes rope_theta since different theta values produce different kernels
+    let kernel_name = format!("rope_fwd_theta{}", rope_theta as u32);
+    let kernel = runtime.ensure_kernel_blockdsl(&kernel_name, || {
         crate::t0::rope_kernels::build_rope_forward()
     })?;
 
@@ -53,7 +55,8 @@ pub fn rope_forward(
         out_buf.gpu_addr() => u64,
         dim as u32 => u32,
         n_tokens as u32 => u32,
-        pos_offset as u32 => u32  // pos_base
+        pos_offset as u32 => u32,  // pos_base
+        rope_theta => f32
     ];
     let (grid_x, _) = crate::t0::rope_kernels::rope_grid(n_tokens as u32);
     runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;

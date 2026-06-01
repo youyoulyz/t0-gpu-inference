@@ -37,6 +37,19 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
 
     assert_eq!(gamma.numel(), dim, "rmsnorm: gamma dim mismatch");
 
+    // Ensure gamma is f32 — the kernel reads f32 from gamma buffer.
+    // Safetensors loads weights as bf16, so we need to convert.
+    let gamma_f32 = if gamma.dtype() == super::super::tensor::DType::BF16 {
+        let data = gamma.to_f32_vec();
+        let buf = runtime.upload_f32(&data)?;
+        super::super::tensor::Tensor::from_buffer(
+            std::sync::Arc::new(buf), &runtime, gamma.shape(),
+            super::super::tensor::DType::F32, "gamma_f32"
+        )
+    } else {
+        gamma.clone()
+    };
+
     // GPU forward via block_dsl: use enough threads so each lane handles few elements
     // WG_SIZE = next_power_of_two(dim) capped at 256, so epl ≤ 2
     let wg_size: u32 = (dim as u32).next_power_of_two().min(256).max(32);
@@ -123,7 +136,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
     // Dispatch: 1 WG per row, each WG = 32 threads
     let ka = crate::kernargs![
         x.gpu_addr() => u64,
-        gamma.gpu_addr() => u64,
+        gamma_f32.gpu_addr() => u64,
         out_buf.gpu_addr() => u64,
         rms_buf.gpu_addr() => u64,
         dim as u32 => u32

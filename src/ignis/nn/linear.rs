@@ -99,7 +99,6 @@ impl Module for Linear {
         if let Some(wt) = wt_bf16 {
             super::super::ops::bf16_matmul::matmul_with_wt_bf16(input, wt, m, k, n, &self.runtime)
         } else {
-            // Fallback to non-cached path
             super::super::ops::bf16_matmul::matmul(input, &self.weight, &self.runtime.device)
         }
     }

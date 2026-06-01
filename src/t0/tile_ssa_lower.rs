@@ -494,6 +494,19 @@ fn lower_tile_op(
             };
             let bytes_per_elem = dtype.bytes();
 
+            // CRITICAL: Apply mask BEFORE address computation to prevent the
+            // register allocator from reusing the mask register for address temps.
+            // The v_add_co instruction clobbers VCC and can reuse mask VGPRs.
+            let saved_exec = if let Some(mask_val) = mask {
+                let mask_v = get_vreg(k, val_map, *mask_val)?;
+                k.v_cmp_gt_u32_imm(mask_v, 0);
+                let saved = k.alloc_sreg();
+                k.save_exec(saved);
+                Some(saved)
+            } else {
+                None
+            };
+
             // 计算 byte address: ptr + indices * bytes_per_elem
             // CRITICAL: compute address BEFORE allocating dst_v to avoid regalloc
             // reusing the index VReg for dst_v (which would zero-init and corrupt it).
@@ -522,19 +535,6 @@ fn lower_tile_op(
             let dst_v = k.alloc_vreg();
             k.v_mov_imm(dst_v, 0); // zero-init for masked-out lanes
 
-            // 如果有 mask，用 EXEC mask 保护
-            let saved_exec = if let Some(mask_val) = mask {
-                // mask 是 bool vector，需要设置到 VCC 再应用到 EXEC
-                let mask_v = get_vreg(k, val_map, *mask_val)?;
-                // v_cmp_ne_u32 mask, 0 → VCC
-                k.v_cmp_gt_u32_imm(mask_v, 0);
-                let saved = k.alloc_sreg();
-                k.save_exec(saved);
-                Some(saved)
-            } else {
-                None
-            };
-
             k.global_load(dst_v, addr, width, 0);
             k.wait_vmcnt(0);
 
@@ -560,6 +560,19 @@ fn lower_tile_op(
             };
             let bytes_per_elem = val_ty.dtype().map(|d| d.bytes()).unwrap_or(4);
 
+            // CRITICAL: Apply mask BEFORE address computation to prevent the
+            // register allocator from reusing the mask register for address temps.
+            // The v_add_co instruction clobbers VCC and can reuse mask VGPRs.
+            let saved_exec = if let Some(mask_val) = mask {
+                let mask_v = get_vreg(k, val_map, *mask_val)?;
+                k.v_cmp_gt_u32_imm(mask_v, 0);
+                let saved = k.alloc_sreg();
+                k.save_exec(saved);
+                Some(saved)
+            } else {
+                None
+            };
+
             let idx_v = get_vreg(k, val_map, *indices)?;
             let byte_off = k.alloc_vreg();
             match bytes_per_elem {
@@ -576,17 +589,6 @@ fn lower_tile_op(
             k.clear_vcc();
             k.v_add_co(addr, addr, byte_off);
             k.v_add_co_ci(VReg(addr.0 + 1), VReg(addr.0 + 1));
-
-            // 如果有 mask，用 EXEC mask 保护
-            let saved_exec = if let Some(mask_val) = mask {
-                let mask_v = get_vreg(k, val_map, *mask_val)?;
-                k.v_cmp_gt_u32_imm(mask_v, 0);
-                let saved = k.alloc_sreg();
-                k.save_exec(saved);
-                Some(saved)
-            } else {
-                None
-            };
 
             k.wait_vmcnt(0);
             k.global_store(addr, val_v, width, 0);
