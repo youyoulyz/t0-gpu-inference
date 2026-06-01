@@ -50,16 +50,15 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
         gamma.clone()
     };
 
-    // GPU forward via block_dsl: use enough threads so each lane handles few elements
-    // WG_SIZE = next_power_of_two(dim) capped at 256, so epl ≤ 2
-    let wg_size: u32 = (dim as u32).next_power_of_two().min(256).max(32);
-    let epl = ((dim as u32 + wg_size - 1) / wg_size) as u32; // ceil(dim / wg_size)
+    // GPU forward via block_dsl: WG_SIZE=32 (single wave).
+    // Use for_range loop (not Rust unroll) to avoid SGPR overflow on large dims.
+    let wg_size: u32 = 32;
     let out_buf = runtime.alloc_f32(rows * dim)?;
     let rms_buf = runtime.alloc_f32(rows)?; // save inv_rms for backward
 
     // Build or reuse kernel
     let kernel = {
-        let name = format!("bdsl_rmsnorm_d{}_wg{}", dim, wg_size);
+        let name = format!("bdsl_rmsnorm_d{}_wg{}_v4", dim, wg_size);
         let cached = runtime.get_kernel(&name);
         if let Some(k) = cached {
             k
@@ -74,29 +73,34 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
             let dim_arg = kb.arg_u32("dim");
 
             let row_id = kb.program_id(0);     // 1 WG per row
-            let lane_id = kb.thread_id();       // 0..31
-
-            // row_base = row_id * dim (element offset within x/out)
+            let lane_id = kb.thread_id();       // vector: [0..31]
             let row_base = row_id.mul(&mut kb, dim_arg);
+            let zero = kb.const_u32(0);
+            let zero_f = kb.const_f32(0.0);
 
-            // Pass 1: accumulate sum of x²
-            // Each lane handles elements lane_id, lane_id+wg_size, lane_id+2*wg_size, ...
-            let mut sum_sq = kb.const_f32(0.0);
-            for j in 0..epl {
-                let col = if j == 0 {
-                    lane_id
-                } else {
-                    let offset = kb.const_u32(j * wg_size);
-                    lane_id.add(&mut kb, offset)
-                };
-                let idx = row_base.add(&mut kb, col);
+            // Pass 1: accumulate sum of x² via for_range
+            // Loop scalar iter: 0, 32, 64, ...; per-thread col = iter + lane_id
+            // Use LDS to accumulate across iterations
+            let lds = kb.lds_alloc(wg_size * 4);
+            kb.lds_store(lds, lane_id, zero_f);
+            kb.barrier();
+
+            let iter1 = kb.for_range(zero, dim_arg, wg_size);
+            {
+                let col = iter1.add(&mut kb, lane_id);
                 let mask = col.lt(&mut kb, dim_arg);
+                let idx = row_base.add(&mut kb, col);
                 let val = kb.load(x_ptr, idx, mask);
-                sum_sq = val.fma(&mut kb, val, sum_sq); // sum_sq += x²
+                let sq = val.mul(&mut kb, val);
+                let cur = kb.lds_load(lds, lane_id);
+                let new_val = cur.add(&mut kb, sq);
+                kb.lds_store(lds, lane_id, new_val);
             }
+            kb.end_for(iter1);
+            kb.barrier();
 
-            // Wave reduce sum
-            sum_sq = kb.wave_reduce_sum_val(sum_sq);
+            let sum_sq = kb.lds_load(lds, lane_id);
+            let sum_sq = kb.wave_reduce_sum_val(sum_sq);
 
             // inv_rms = 1/sqrt(sum_sq/dim + eps)
             let dim_f = dim_arg.to_f32(&mut kb);
@@ -107,26 +111,22 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
             let inv_rms = rms.rcp(&mut kb);
 
             // Save inv_rms (only lane 0 writes)
-            let zero_u = kb.const_u32(0);
             let one_u = kb.const_u32(1);
             let lane_mask = lane_id.lt(&mut kb, one_u);
             kb.store(rms_ptr, row_id, inv_rms, lane_mask);
 
-            // Pass 2: normalize and store
-            for j in 0..epl {
-                let col = if j == 0 {
-                    lane_id
-                } else {
-                    let offset = kb.const_u32(j * wg_size);
-                    lane_id.add(&mut kb, offset)
-                };
-                let idx = row_base.add(&mut kb, col);
+            // Pass 2: normalize and store via for_range
+            let iter2 = kb.for_range(zero, dim_arg, wg_size);
+            {
+                let col = iter2.add(&mut kb, lane_id);
                 let mask = col.lt(&mut kb, dim_arg);
+                let idx = row_base.add(&mut kb, col);
                 let val = kb.load(x_ptr, idx, mask);
                 let g = kb.load(gamma_ptr, col, mask);
                 let normed = val.mul(&mut kb, inv_rms).mul(&mut kb, g);
                 kb.store(out_ptr, idx, normed, mask);
             }
+            kb.end_for(iter2);
 
             let compiled = kb.compile(Target::GFX1100)?;
             runtime.compile_dsl(compiled)?

@@ -33,7 +33,7 @@ const WG_SIZE: u32 = 256;
 /// Kernarg layout: [input:u64, weight:u64, output:u64, cols:u32, eps:f32]
 /// Grid: (rows * WG_SIZE, 1, 1) — one WG per row
 ///
-/// Constraint: cols ≤ WG_SIZE (256)
+/// Supports cols > WG_SIZE via a loop: each thread handles ceil(cols/WG_SIZE) elements.
 pub fn build_rmsnorm_forward() -> BlockKernel {
     let mut kb = BlockKernel::new("rmsnorm_fwd", WG_SIZE);
 
@@ -43,21 +43,30 @@ pub fn build_rmsnorm_forward() -> BlockKernel {
     let cols = kb.arg_u32("cols");
     let eps = kb.arg_f32("eps");
 
-    let tid = kb.thread_id();
-    let pid = kb.program_id(0); // row index
+    let tid = kb.thread_id();   // vector: [0, 1, ..., WG_SIZE-1]
+    let pid = kb.program_id(0); // row index (scalar)
 
-    let row_base = pid.mul(&mut kb, cols);
-    let offset = row_base.add(&mut kb, tid);
-    let mask = tid.lt(&mut kb, cols);
-
-    // Load input element
-    let x = kb.load(input_ptr, offset, mask);
-
-    // Phase 1: mean(x²)
-    let x_sq = x.mul(&mut kb, x);
+    let row_base = pid.mul(&mut kb, cols); // scalar
     let zero_f = kb.const_f32(0.0);
-    let x_sq_masked = mask.select(&mut kb, x_sq, zero_f);
-    let sum_sq = kb.wg_reduce_sum(x_sq_masked);
+    let zero = kb.const_u32(0);
+
+    // Phase 1: sum(x²) via for_range_acc
+    // Loop scalar iter: 0, WG_SIZE, 2*WG_SIZE, ...
+    // Per-thread col = iter + tid (vector)
+    let (iter1, sum_sq) = kb.for_range_acc(zero, cols, WG_SIZE, zero_f);
+    {
+        let col = iter1.add(&mut kb, tid); // vector: per-thread index
+        let in_bounds = col.lt(&mut kb, cols);
+        let offset = row_base.add(&mut kb, col);
+        let x = kb.load(input_ptr, offset, in_bounds);
+        let x_sq = x.mul(&mut kb, x);
+        let x_sq_masked = in_bounds.select(&mut kb, x_sq, zero_f);
+        let new_acc = sum_sq.add(&mut kb, x_sq_masked);
+        let _ = kb.end_for_acc(iter1, new_acc);
+    }
+
+    // WG-level sum (wave_reduce + LDS cross-wave)
+    let sum_sq = kb.wg_reduce_sum(sum_sq);
     let cols_f = cols.to_f32(&mut kb);
     let mean_sq = sum_sq.div(&mut kb, cols_f);
 
@@ -65,11 +74,19 @@ pub fn build_rmsnorm_forward() -> BlockKernel {
     let mean_sq_eps = mean_sq.add(&mut kb, eps);
     let rstd = mean_sq_eps.rsqrt(&mut kb);
 
-    // Phase 3: y = (x * rstd) * weight
-    let x_norm = x.mul(&mut kb, rstd);
-    let w = kb.load(weight_ptr, tid, mask); // weight[col]
-    let y = x_norm.mul(&mut kb, w);
-    kb.store(output_ptr, offset, y, mask);
+    // Phase 3: normalize and scale via for_range
+    let iter2 = kb.for_range(zero, cols, WG_SIZE);
+    {
+        let col = iter2.add(&mut kb, tid);
+        let in_bounds = col.lt(&mut kb, cols);
+        let offset = row_base.add(&mut kb, col);
+        let x = kb.load(input_ptr, offset, in_bounds);
+        let x_norm = x.mul(&mut kb, rstd);
+        let w = kb.load(weight_ptr, col, in_bounds);
+        let y = x_norm.mul(&mut kb, w);
+        kb.store(output_ptr, offset, y, in_bounds);
+    }
+    kb.end_for(iter2);
 
     kb
 }
