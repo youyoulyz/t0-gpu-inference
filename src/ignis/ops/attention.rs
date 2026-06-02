@@ -163,9 +163,18 @@ pub fn standard_attention(
 
         // Step 5: GPU GEMM scores = Q_head @ K_T → [seq_len, kv_len]
         let t1 = std::time::Instant::now();
-        let gemm_out = super::super::ops::bf16_matmul::gemm_f32_raw(
-            runtime, &q_head_buf, &k_t_buf, seq_len, head_dim, kv_len,
-        )?;
+        let gemm_out = if std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
+            let q_data = runtime.read_f32(&q_head_buf, seq_len * head_dim);
+            let k_data = runtime.read_f32(&k_t_buf, head_dim * kv_len);
+            let y = super::super::ops::bf16_matmul::gemm_f32_cpu(&q_data, &k_data, seq_len, head_dim, kv_len);
+            let buf = runtime.alloc_f32(seq_len * kv_len)?;
+            runtime.write_f32(&buf, &y);
+            buf
+        } else {
+            super::super::ops::bf16_matmul::gemm_f32_raw(
+                runtime, &q_head_buf, &k_t_buf, seq_len, head_dim, kv_len,
+            )?
+        };
         let t_gemm = t1.elapsed();
 
         // Step 6: GPU scale + causal mask
@@ -216,9 +225,18 @@ pub fn standard_attention(
 
         // Step 8: GPU GEMM out_head = weights @ V_head → [seq_len, head_dim]
         let t4 = std::time::Instant::now();
-        let out_head_buf = super::super::ops::bf16_matmul::gemm_f32_raw(
-            runtime, &weights_buf, &v_head_buf, seq_len, kv_len, head_dim,
-        )?;
+        let out_head_buf = if std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
+            let w_data = runtime.read_f32(&weights_buf, seq_len * kv_len);
+            let v_data = runtime.read_f32(&v_head_buf, kv_len * head_dim);
+            let y = super::super::ops::bf16_matmul::gemm_f32_cpu(&w_data, &v_data, seq_len, kv_len, head_dim);
+            let buf = runtime.alloc_f32(seq_len * head_dim)?;
+            runtime.write_f32(&buf, &y);
+            buf
+        } else {
+            super::super::ops::bf16_matmul::gemm_f32_raw(
+                runtime, &weights_buf, &v_head_buf, seq_len, kv_len, head_dim,
+            )?
+        };
         let t_gemm2 = t4.elapsed();
 
         // Step 9: GPU scatter out_head → out_buf at position h

@@ -87,9 +87,29 @@ impl Module for Linear {
         let k = self.in_features;
         let n = self.out_features;
 
-        // Debug: force non-cached path for gate/up/down
-        if n == 3072 || k == 3072 {
-            return super::super::ops::bf16_matmul::matmul(input, &self.weight, &self.runtime.device);
+        // CPU f32 GEMM path (for debugging precision issues)
+        // Set T0_F32_GEMM=1 to enable
+        if std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
+            let x_data = input.to_f32_vec();
+            let w_raw = self.weight.to_f32_vec();
+            // Weight is stored as [in_features, out_features] = [K, N]
+            // CPU GEMM expects [K, N] layout: w[kk * N + j]
+            // If weight shape matches [K, N], use directly; otherwise transpose
+            let w_shape = self.weight.shape();
+            let w_data = if w_shape.len() == 2 && w_shape[0] == k && w_shape[1] == n {
+                w_raw
+            } else {
+                // Transpose [N, K] → [K, N]
+                let mut transposed = vec![0.0f32; k * n];
+                for i in 0..k {
+                    for j in 0..n {
+                        transposed[i * n + j] = w_raw[j * k + i];
+                    }
+                }
+                transposed
+            };
+            let y_data = super::super::ops::bf16_matmul::gemm_f32_cpu(&x_data, &w_data, m, k, n);
+            return super::super::tensor::Tensor::from_f32(&self.runtime, &y_data, &[m, n], "cpu_gemm_out");
         }
 
         // Get or compute cached bf16 transposed weight

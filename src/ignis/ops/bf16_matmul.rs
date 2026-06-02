@@ -266,6 +266,24 @@ fn pad_tile(size: usize, tile: u32) -> usize {
 
 // ── Core GEMM dispatch ──
 
+/// Pure f32 CPU GEMM: Y[M,N] = X[M,K] @ W[K,N]
+/// Slow but exact — used for debugging precision issues.
+pub fn gemm_f32_cpu(
+    x_f32: &[f32], w_f32: &[f32], m: usize, k: usize, n: usize,
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for kk in 0..k {
+                sum += x_f32[i * k + kk] * w_f32[kk * n + j];
+            }
+            y[i * n + j] = sum;
+        }
+    }
+    y
+}
+
 /// Forward GEMM: Y[M,N] = X[M,K] @ W[K,N]
 /// Accepts raw f32 buffers, handles bf16 conversion + padding internally.
 #[cfg(feature = "rocm")]
@@ -751,6 +769,47 @@ mod gemm_debug_tests {
         eprintln!("  y[0..5]: {:?}", &y_data[..5]);
         eprintln!("  e[0..5]: {:?}", &expected[..5]);
         assert!(max_rel_err < 0.05, "GEMM max_rel_err={:.2}%", max_rel_err * 100.0);
+    }
+
+    #[test]
+    fn test_gemm_down_proj_m7() {
+        // Test GEMM with down_proj dimensions: M=7, K=3072, N=1024
+        let r = rt();
+        let m = 7;
+        let k = 3072;
+        let n = 1024;
+
+        let mut rng_state = 42u64;
+        let mut rand = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.03
+        };
+
+        let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+
+        let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += x_data[i * k + kk] * w_data[kk * n + j];
+                }
+                expected[i * n + j] = sum;
+            }
+        }
+
+        let y_norm: f32 = y_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let e_norm: f32 = expected.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let rel = (y_norm - e_norm).abs() / e_norm;
+        eprintln!("GEMM {}x{}x{}: y_norm={:.4} e_norm={:.4} rel={:.2}%", m, k, n, y_norm, e_norm, rel * 100.0);
+        assert!(rel < 0.05, "GEMM rel={:.2}%", rel * 100.0);
     }
 
     #[test]
