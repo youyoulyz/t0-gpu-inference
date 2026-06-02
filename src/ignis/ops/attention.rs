@@ -132,6 +132,23 @@ pub fn standard_attention(
         let (gx, _) = ak::attn_gather_grid(kv_len as u32);
         runtime.dispatch(&gather_kernel, [gx, 1, 1], &ka)?;
 
+        // Debug: check K and V values for head 0 during decode
+        if h == 0 && seq_len == 1 {
+            let mut k_data = vec![0f32; kv_len * head_dim];
+            k_head_buf.read(unsafe { std::slice::from_raw_parts_mut(k_data.as_mut_ptr() as *mut u8, kv_len * head_dim * 4) });
+            let k_norm: f32 = k_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let mut v_data = vec![0f32; kv_len * head_dim];
+            v_head_buf.read(unsafe { std::slice::from_raw_parts_mut(v_data.as_mut_ptr() as *mut u8, kv_len * head_dim * 4) });
+            let v_norm: f32 = v_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            // Check last K entry (the newly written one)
+            let last_k = (kv_len - 1) * head_dim;
+            let prev_k = if kv_len > 1 { (kv_len - 2) * head_dim } else { 0 };
+            eprintln!("    [attn decode h=0] kv_len={} K_norm={:.4} V_norm={:.4} K_last[0..3]={:.4} {:.4} {:.4} {:.4} K_prev[0..3]={:.4} {:.4} {:.4} {:.4}",
+                kv_len, k_norm, v_norm,
+                k_data[last_k], k_data[last_k+1], k_data[last_k+2], k_data[last_k+3],
+                k_data[prev_k], k_data[prev_k+1], k_data[prev_k+2], k_data[prev_k+3]);
+        }
+
         // Step 4: GPU transpose K_head [kv_len, head_dim] → K_T [head_dim, kv_len]
         let ka = crate::kernargs![
             k_head_buf.gpu_addr() => u64,

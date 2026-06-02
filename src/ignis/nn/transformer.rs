@@ -245,7 +245,7 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
-        let dbg = layer_idx == 0;
+        let dbg = layer_idx == 0 || layer_idx == 27;
         let norm = |t: &Tensor| -> f32 { t.to_f32_vec().iter().map(|v| v*v).sum::<f32>().sqrt() };
 
         // === Attention sub-layer ===
@@ -463,7 +463,17 @@ impl TransformerLayer {
         }
 
         let result = ops::add::add(&x2, &ffn_out, device)?;
-        if dbg { eprintln!("  [L{}] final={:.4}", layer_idx, norm(&result)); }
+        if dbg {
+            // CPU reference for x2 + ffn_out
+            let x2d = x2.to_f32_vec();
+            let fd = ffn_out.to_f32_vec();
+            let rd = result.to_f32_vec();
+            let cpu_sum_norm: f32 = x2d.iter().zip(fd.iter()).map(|(a, b)| (a + b).powi(2)).sum::<f32>().sqrt();
+            let gpu_norm: f32 = rd.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let last_s = (seq_len - 1) * self.dim;
+            eprintln!("  [L{}] final: CPU_sum={:.4} GPU={:.4} x2[last][0]={:.4} ffn[last][0]={:.4} result[last][0]={:.4}",
+                layer_idx, cpu_sum_norm, gpu_norm, x2d[last_s], fd[last_s], rd[last_s]);
+        }
         Ok(result)
     }
 }

@@ -162,11 +162,18 @@ impl LanguageModel {
 
         // Run through all transformer layers with KV cache
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let h_before = {
+                let d = h.to_f32_vec();
+                d.iter().map(|x| x * x).sum::<f32>().sqrt()
+            };
             h = layer.forward_inference(&h, 0, layer_idx, kv_cache)?;
             let d = h.to_f32_vec();
             let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
             let has_nan = d.iter().any(|x| x.is_nan());
-            eprintln!("[Prefill] layer_{}: norm={:.4} nan={}", layer_idx, n, has_nan);
+            if layer_idx <= 2 || layer_idx >= 26 {
+                eprintln!("[Prefill] layer_{}: in={:.4} out={:.4} ratio={:.4} nan={}",
+                    layer_idx, h_before, n, n / h_before, has_nan);
+            }
         }
 
         // Advance KV cache position once after all layers have written
@@ -174,6 +181,18 @@ impl LanguageModel {
 
         // Final RMSNorm
         h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
+
+        // Debug: check final hidden state
+        {
+            let full = h.to_f32_vec();
+            let n: f32 = full.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let last_s = (seq_len - 1) * self.config.hidden_size;
+            let last_norm: f32 = full[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let gamma_data = self.final_norm_gamma.to_f32_vec();
+            let gamma_norm: f32 = gamma_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("[Prefill] final_hidden: total={:.4} last_tok={:.4} gamma_norm={:.4} gamma_first3={:.4} {:.4} {:.4}",
+                n, last_norm, gamma_norm, gamma_data[0], gamma_data[1], gamma_data[2]);
+        }
 
         // Take last token's hidden state: [1, hidden_size]
         let hidden = self.config.hidden_size;
@@ -185,7 +204,19 @@ impl LanguageModel {
         let last_hidden = Tensor::from_f32(&self.runtime, &last_hidden_data, &[1, hidden], "last_hidden")?;
 
         // LM head → logits [1, vocab_size]
-        self.lm_head.forward(&last_hidden)
+        let logits = self.lm_head.forward(&last_hidden)?;
+
+        // Debug: check logit stats
+        {
+            let logits_data = logits.to_f32_vec();
+            let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min_logit = logits_data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mean_logit: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
+            let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            eprintln!("[Prefill] logits: max={:.4} (id={}) min={:.4} mean={:.4}", max_logit, max_idx, min_logit, mean_logit);
+        }
+
+        Ok(logits)
     }
 
     /// Decode: process a single new token with KV cache, return logits.
@@ -201,6 +232,7 @@ impl LanguageModel {
 
         // Embed single token via CPU
         let mut h = self.embedding.forward_cpu(&[token_id])?;
+        eprintln!("[Decode] pos={} token_id={} kv_pos_before={}", pos, token_id, kv_cache.position());
 
         // Run through all transformer layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -209,6 +241,7 @@ impl LanguageModel {
 
         // Advance KV cache position once after all layers have written
         kv_cache.advance();
+        eprintln!("[Decode] kv_pos_after={}", kv_cache.position());
 
         // Final RMSNorm
         h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
