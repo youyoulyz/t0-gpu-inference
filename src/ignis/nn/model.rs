@@ -163,6 +163,10 @@ impl LanguageModel {
         // Run through all transformer layers with KV cache
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward_inference(&h, 0, layer_idx, kv_cache)?;
+            let d = h.to_f32_vec();
+            let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let has_nan = d.iter().any(|x| x.is_nan());
+            eprintln!("[Prefill] layer_{}: norm={:.4} nan={}", layer_idx, n, has_nan);
         }
 
         // Advance KV cache position once after all layers have written

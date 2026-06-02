@@ -446,9 +446,10 @@ pub fn build_f32_to_bf16_transpose_padded() -> BlockKernel {
     let row = kb.program_id(0);
 
     // EPL loop: each thread handles elements tid, tid+WG_SIZE, tid+2*WG_SIZE, ...
+    // With WG_SIZE=128 and epl=24: supports up to 128*24=3072 cols
     let wg = kb.const_u32(WG_SIZE);
     let mut col = tid;
-    let epl = 8;
+    let epl = 24;
     for _ in 0..epl {
         let in_bounds = col.lt(&mut kb, real_cols);
         let src_off = row.mul(&mut kb, real_cols).add(&mut kb, col);

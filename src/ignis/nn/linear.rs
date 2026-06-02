@@ -87,6 +87,11 @@ impl Module for Linear {
         let k = self.in_features;
         let n = self.out_features;
 
+        // Debug: force non-cached path for gate/up/down
+        if n == 3072 || k == 3072 {
+            return super::super::ops::bf16_matmul::matmul(input, &self.weight, &self.runtime.device);
+        }
+
         // Get or compute cached bf16 transposed weight
         let wt_bf16 = self.cached_wt_bf16.get_or_init(|| {
             // Convert weight f32 → bf16 and transpose to [N, K]

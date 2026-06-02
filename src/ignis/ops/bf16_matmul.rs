@@ -752,4 +752,128 @@ mod gemm_debug_tests {
         eprintln!("  e[0..5]: {:?}", &expected[..5]);
         assert!(max_rel_err < 0.05, "GEMM max_rel_err={:.2}%", max_rel_err * 100.0);
     }
+
+    #[test]
+    fn test_gemm_gate_proj_size() {
+        // Test GEMM with gate_proj dimensions: M=7, K=1024, N=3072
+        let r = rt();
+        let m = 7;
+        let k = 1024;
+        let n = 3072;
+
+        let mut rng_state = 42u64;
+        let mut rand = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.03
+        };
+
+        let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+
+        let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += x_data[i * k + kk] * w_data[kk * n + j];
+                }
+                expected[i * n + j] = sum;
+            }
+        }
+
+        let mut max_err: f32 = 0.0;
+        let mut max_rel_err: f32 = 0.0;
+        for i in 0..m * n {
+            let err = (y_data[i] - expected[i]).abs();
+            let rel = if expected[i].abs() > 1e-6 { err / expected[i].abs() } else { 0.0 };
+            max_err = max_err.max(err);
+            max_rel_err = max_rel_err.max(rel);
+        }
+        let y_norm: f32 = y_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let e_norm: f32 = expected.iter().map(|x| x*x).sum::<f32>().sqrt();
+        eprintln!("GEMM {}x{}x{}: max_err={:.6} max_rel={:.2}% y_norm={:.4} e_norm={:.4}",
+            m, k, n, max_err, max_rel_err * 100.0, y_norm, e_norm);
+        assert!(max_rel_err < 0.05, "GEMM max_rel_err={:.2}%", max_rel_err * 100.0);
+    }
+
+    #[test]
+    fn test_gemm_m1_k1024_n3072() {
+        // Test GEMM: M=1, K=1024, N=3072
+        let r = rt();
+        let m = 1; let k = 1024; let n = 3072;
+        let mut rng_state = 42u64;
+        let mut rand = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.03
+        };
+        let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+        let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m { for j in 0..n { let mut s = 0.0f32; for kk in 0..k { s += x_data[i*k+kk] * w_data[kk*n+j]; } expected[i*n+j] = s; } }
+        let y_norm: f32 = y_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let e_norm: f32 = expected.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let rel = (y_norm - e_norm).abs() / e_norm;
+        eprintln!("GEMM {}x{}x{}: y_norm={:.4} e_norm={:.4} rel={:.2}%", m, k, n, y_norm, e_norm, rel * 100.0);
+        assert!(rel < 0.05, "GEMM rel={:.2}%", rel * 100.0);
+    }
+
+    #[test]
+    fn test_gemm_m1_k1024_n1024() {
+        let r = rt();
+        let m = 1; let k = 1024; let n = 1024;
+        let mut rng_state = 42u64;
+        let mut rand = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.03
+        };
+        let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+        let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+        let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+        let y = matmul(&x, &w, &r.device).unwrap();
+        let y_data = y.to_f32_vec();
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m { for j in 0..n { let mut s = 0.0f32; for kk in 0..k { s += x_data[i*k+kk] * w_data[kk*n+j]; } expected[i*n+j] = s; } }
+        let y_norm: f32 = y_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let e_norm: f32 = expected.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let rel = (y_norm - e_norm).abs() / e_norm;
+        eprintln!("GEMM {}x{}x{}: y_norm={:.4} e_norm={:.4} rel={:.2}%", m, k, n, y_norm, e_norm, rel * 100.0);
+        assert!(rel < 0.05, "GEMM rel={:.2}%", rel * 100.0);
+    }
+
+    #[test]
+    fn test_gemm_n_threshold() {
+        let r = rt();
+        let m = 1; let k = 1024;
+        for n in [512, 1024, 1536, 2048, 2560, 3072] {
+            let mut rng_state = 42u64;
+            let mut rand = || -> f32 {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.03
+            };
+            let x_data: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+            let w_data: Vec<f32> = (0..k * n).map(|_| rand()).collect();
+            let x = Tensor::from_f32(&r, &x_data, &[m, k], "x").unwrap();
+            let w = Tensor::from_f32(&r, &w_data, &[k, n], "w").unwrap();
+            let y = matmul(&x, &w, &r.device).unwrap();
+            let y_data = y.to_f32_vec();
+            let mut expected = vec![0.0f32; m * n];
+            for i in 0..m { for j in 0..n { let mut s = 0.0f32; for kk in 0..k { s += x_data[i*k+kk] * w_data[kk*n+j]; } expected[i*n+j] = s; } }
+            let y_norm: f32 = y_data.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let e_norm: f32 = expected.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let rel = (y_norm - e_norm).abs() / e_norm;
+            eprintln!("GEMM {}x{}x{}: y_norm={:.4} e_norm={:.4} rel={:.2}%", m, k, n, y_norm, e_norm, rel * 100.0);
+        }
+    }
 }

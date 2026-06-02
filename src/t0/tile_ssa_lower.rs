@@ -884,9 +884,18 @@ fn lower_tile_op(
             match (src_dtype, to) {
                 (Some(ScalarDType::U32), ScalarDType::F32) => k.v_cvt_f32_u32(dst, sv),
                 (Some(ScalarDType::F32), ScalarDType::U32) => k.v_cvt_u32_f32(dst, sv),
-                // F32 → BF16: truncate lower 16 bits (keep upper 16 as bf16)
+                // F32 → BF16: round-to-nearest-even
+                // 1. tmp = src + 0x7FFF + ((src >> 16) & 1)
+                // 2. dst = tmp >> 16
                 (Some(ScalarDType::F32), ScalarDType::BF16) => {
-                    k.v_lshrrev_b32(dst, 16, sv);
+                    let tmp = k.alloc_vreg();
+                    let carry = k.alloc_vreg();
+                    k.v_lshrrev_b32(carry, 16, sv);       // carry = src >> 16
+                    k.v_and_b32_imm(carry, carry, 1);      // carry = carry & 1
+                    k.v_mov_imm(tmp, 0x7FFF);              // tmp = 0x7FFF
+                    k.v_add_u32(tmp, sv, tmp);             // tmp = src + 0x7FFF
+                    k.v_add_u32(dst, tmp, carry);          // dst = tmp + carry
+                    k.v_lshrrev_b32(dst, 16, dst);         // dst = dst >> 16
                 }
                 // BF16 → F32: shift left 16 to restore f32 format
                 (Some(ScalarDType::BF16), ScalarDType::F32) => {
