@@ -290,10 +290,11 @@ impl LanguageModel {
 
         // Decode phase: generate tokens one at a time
         let start_pos = prompt_ids.len();
+        let mut current_token = next_token;
         for step in 0..max_tokens - 1 {
             let t0 = std::time::Instant::now();
             let pos = start_pos + step;
-            let logits = self.forward_decode(next_token, pos, kv_cache)?;
+            let logits = self.forward_decode(current_token, pos, kv_cache)?;
             let decode_ms = t0.elapsed().as_millis();
 
             // Debug: show top token and logit stats
@@ -302,8 +303,8 @@ impl LanguageModel {
             let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
             let mean_logit: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
 
-            let next_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
-            generated.push(next_token);
+            current_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
+            generated.push(current_token);
 
             if next_token == eos_id {
                 eprintln!("[Generate] EOS at step {}", step + 1);
