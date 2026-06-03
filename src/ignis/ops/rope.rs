@@ -15,19 +15,20 @@ use super::super::gpu_context::GpuRuntime;
 /// Apply RoPE to a tensor.
 ///
 /// # Arguments
-/// - `x`: [n_tokens, dim] f32 tensor
+/// - `x`: [n_rows, dim] f32 tensor (may be multi-head: n_rows = seq_len * n_heads)
 /// - `pos_offset`: starting position index (0 for prefill, current_pos for decode)
-/// - `rope_theta`: base frequency (Qwen3 uses 1_000_000.0). Note: the kernel uses
-///   a fixed ln(10000) base; this parameter is kept for API compatibility.
+/// - `rope_theta`: base frequency (Qwen3 uses 1_000_000.0)
+/// - `n_heads`: number of heads (1 if single-head, >1 if multi-head reshaped)
 /// - `runtime`: GPU runtime
 ///
 /// # Returns
-/// - output: [n_tokens, dim] f32 tensor with RoPE applied
+/// - output: [n_rows, dim] f32 tensor with RoPE applied
 #[cfg(feature = "rocm")]
 pub fn rope_forward(
     x: &Tensor,
     pos_offset: usize,
     rope_theta: f32,
+    n_heads: usize,
     runtime: &Arc<GpuRuntime>,
 ) -> Result<Tensor, String> {
     crate::profile_scope!("rope");
@@ -36,33 +37,33 @@ pub fn rope_forward(
         vec![crate::profiler::ShapeInfo::new(x.shape())],
     );
     let shape = x.shape();
-    assert!(shape.len() == 2, "rope: expected 2D [n_tokens, dim], got {:?}", shape);
-    let n_tokens = shape[0];
+    assert!(shape.len() == 2, "rope: expected 2D [n_rows, dim], got {:?}", shape);
+    let n_rows = shape[0];
     let dim = shape[1];
     assert!(dim % 2 == 0, "rope: dim must be even, got {}", dim);
     assert!(dim <= 256, "rope: dim {} exceeds kernel limit 256", dim);
 
-    let out_buf = runtime.alloc_f32(n_tokens * dim)?;
+    let out_buf = runtime.alloc_f32(n_rows * dim)?;
 
-    // Cache key includes rope_theta since different theta values produce different kernels
-    let kernel_name = format!("rope_fwd_theta{}", rope_theta as u32);
+    let n_heads_shift = n_heads.trailing_zeros();
+    let kernel_name = format!("rope_fwd_s{}_theta{}", n_heads_shift, rope_theta as u32);
     let kernel = runtime.ensure_kernel_blockdsl(&kernel_name, || {
-        crate::t0::rope_kernels::build_rope_forward()
+        crate::t0::rope_kernels::build_rope_forward(n_heads_shift)
     })?;
 
     let ka = crate::kernargs![
         x.gpu_addr() => u64,
         out_buf.gpu_addr() => u64,
         dim as u32 => u32,
-        n_tokens as u32 => u32,
-        pos_offset as u32 => u32,  // pos_base
+        0u32 => u32,  // reserved (was n_tokens)
+        pos_offset as u32 => u32,
         rope_theta => f32
     ];
-    let (grid_x, _) = crate::t0::rope_kernels::rope_grid(n_tokens as u32);
+    let (grid_x, _) = crate::t0::rope_kernels::rope_grid(n_rows as u32);
     runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
 
     let out_arc = Arc::new(out_buf);
-    Ok(Tensor::from_buffer(out_arc, runtime, &[n_tokens, dim],
+    Ok(Tensor::from_buffer(out_arc, runtime, &[n_rows, dim],
         super::super::tensor::DType::F32, "rope_out"))
 }
 
@@ -207,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_rope_compile_fwd() {
-        let kb = crate::t0::rope_kernels::build_rope_forward();
+        let kb = crate::t0::rope_kernels::build_rope_forward(0);
         let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("RoPE fwd compile");
         assert!(!ck.elf.is_empty());
     }

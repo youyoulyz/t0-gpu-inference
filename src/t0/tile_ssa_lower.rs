@@ -651,6 +651,7 @@ fn lower_tile_op(
                         let vdst = k.alloc_vreg();
                         match bin_op {
                             BinOpKind::Sub => k.v_sub_u32(vdst, lv, rv),
+                            BinOpKind::Shr => k.v_lshrrev_b32_from_vgpr(vdst, rv, lv),
                             _ => return Err(format!("Unimplemented scalar binop: {:?}", bin_op)),
                         }
                         val_map.insert(*result, MachineVal::VReg(vdst));

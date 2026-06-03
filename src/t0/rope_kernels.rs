@@ -25,28 +25,26 @@ const WG_SIZE: u32 = 128;
 
 /// Build RoPE forward kernel.
 ///
-/// Kernarg layout: [x:u64, out:u64, d_model:u32, n_tokens:u32, pos_base:u32, rope_theta:f32]
+/// Build RoPE forward kernel.
 ///
-/// - x: (n_tokens × d_model) f32 — input embeddings
-/// - out: (n_tokens × d_model) f32 — output (rotated)
-/// - d_model: embedding dimension (must be even, ≤ WG_SIZE*2)
-/// - n_tokens: number of tokens
-/// - pos_base: starting position offset (0 for prefill, current_pos for decode)
-/// - rope_theta: base frequency (e.g., 10000 for standard, 1000000 for Qwen3)
+/// Kernarg layout: [x:u64, out:u64, d_model:u32, _reserved:u32, pos_base:u32, rope_theta:f32]
 ///
-/// Grid: (n_tokens * WG_SIZE, 1, 1)
-pub fn build_rope_forward() -> BlockKernel {
-    let mut kb = BlockKernel::new("rope_fwd", WG_SIZE);
+/// The kernel applies RoPE to each row. Position = pos_base + pid >> n_heads_shift.
+/// n_heads_shift is baked in at kernel build time (compile-time constant).
+///
+/// Grid: (n_rows * WG_SIZE, 1, 1)
+pub fn build_rope_forward(n_heads_shift: u32) -> BlockKernel {
+    let mut kb = BlockKernel::new(&format!("rope_fwd_s{}", n_heads_shift), WG_SIZE);
 
     let x_ptr = kb.arg_ptr("x");
     let out_ptr = kb.arg_ptr("out");
     let d_model = kb.arg_u32("d_model");
-    let _n_tokens = kb.arg_u32("n_tokens");
+    let _reserved = kb.arg_u32("_reserved");  // was n_tokens, kept for kernarg layout compat
     let pos_base = kb.arg_u32("pos_base");
     let rope_theta = kb.arg_f32("rope_theta");
 
     let tid = kb.thread_id();     // pair index within row (0..d_model/2-1)
-    let pid = kb.program_id(0);   // token index
+    let pid = kb.program_id(0);   // row index
 
     // Compute indices for the pair
     // even_idx = 2 * tid, odd_idx = 2 * tid + 1
@@ -92,8 +90,14 @@ pub fn build_rope_forward() -> BlockKernel {
     // Step 3: freq = exp(log_freq)
     let freq = log_freq.exp(&mut kb);
 
-    // Step 4: theta = (pos_base + pid) * freq
-    let pos = pos_base.add(&mut kb, pid);
+    // Step 4: theta = (pos_base + token_idx) * freq
+    // token_idx = pid >> n_heads_shift (compile-time constant)
+    let token_idx = if n_heads_shift > 0 {
+        pid.shr(&mut kb, n_heads_shift as u8)
+    } else {
+        pid
+    };
+    let pos = pos_base.add(&mut kb, token_idx);
     let pos_f = pos.to_f32(&mut kb);
     let theta = pos_f.mul(&mut kb, freq);
 
@@ -257,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_rope_fwd_compiles() {
-        let kb = build_rope_forward();
+        let kb = build_rope_forward(0);
         let ck = kb.compile_via_ssa(Target::GFX1100).expect("RoPE fwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RoPE fwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
@@ -299,7 +303,7 @@ mod tests {
         let x_buf = rt.upload_f32(&x).unwrap();
         let out_buf = rt.alloc_f32(n).unwrap();
 
-        let kb = build_rope_forward();
+        let kb = build_rope_forward(0);
         let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
         let config = KernelLoadConfig {
             workgroup_size: ck.workgroup_size,

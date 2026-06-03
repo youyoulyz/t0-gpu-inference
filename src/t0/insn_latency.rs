@@ -121,7 +121,7 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::VFmaF32 { .. } |
         Op::VMov { .. } | Op::VMovFromSgpr { .. } |
         Op::VMulLoU32 { .. } |
-        Op::VLshlrevB32 { .. } | Op::VLshrrevB32 { .. } |
+        Op::VLshlrevB32 { .. } | Op::VLshrrevB32 { .. } | Op::VLshrrevB32Vgpr { .. } |
         Op::VAddCo { .. } | Op::VAddCoCi { .. } |
         Op::VAddCOU32 { .. } | Op::VAddCCU32 { .. } |
         Op::VCndmaskB32 { .. } |

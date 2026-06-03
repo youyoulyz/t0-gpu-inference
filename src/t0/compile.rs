@@ -342,6 +342,11 @@ impl T0Kernel {
         self.ops.push(Op::VLshrrevB32 { dst, shift, src });
     }
 
+    /// v_lshrrev_b32 with VGPR shift: dst = src >> shift_vgpr
+    pub fn v_lshrrev_b32_from_vgpr(&mut self, dst: VReg, shift_vgpr: VReg, src: VReg) {
+        self.ops.push(Op::VLshrrevB32Vgpr { dst, shift: shift_vgpr, src });
+    }
+
     pub fn v_mul_lo_u32(&mut self, dst: VReg, a: VReg, b: VReg) {
         self.ops.push(Op::VMulLoU32 { dst, src0: a, src1: b });
     }

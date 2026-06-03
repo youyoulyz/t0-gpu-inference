@@ -400,6 +400,12 @@ impl AsmEmitter {
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}v_lshrrev_b32 v{}, {}, v{}", self.indent, vd, shift, vs).unwrap();
             }
+            Op::VLshrrevB32Vgpr { dst, shift, src } => {
+                let vd = a.phys_v(*dst);
+                let vshift = a.phys_v(*shift);
+                let vs = a.phys_v(*src);
+                writeln!(self.buf, "{}v_lshrrev_b32 v{}, v{}, v{}", self.indent, vd, vshift, vs).unwrap();
+            }
             Op::VAndB32 { dst, src0, src1 } => {
                 let vd = a.phys_v(*dst);
                 writeln!(self.buf, "{}v_and_b32 v{}, {}, {}",

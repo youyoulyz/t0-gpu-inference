@@ -237,6 +237,7 @@ pub enum Op {
     VMulLoU32 { dst: VReg, src0: VReg, src1: VReg },
     VLshlrevB32 { dst: VReg, shift: u8, src: VReg },
     VLshrrevB32 { dst: VReg, shift: u8, src: VReg },
+    VLshrrevB32Vgpr { dst: VReg, shift: VReg, src: VReg },
     VAndB32 { dst: VReg, src0: Operand, src1: Operand },
     VReadfirstlane { dst: SReg, src: VReg },
 
@@ -576,6 +577,7 @@ impl Op {
             Op::VMulLoU32 { dst, src0, src1 } => vec![*dst, *src0, *src1],
             Op::VLshlrevB32 { dst, src, .. } |
             Op::VLshrrevB32 { dst, src, .. } => vec![*dst, *src],
+            Op::VLshrrevB32Vgpr { dst, shift, src } => vec![*dst, *shift, *src],
 
             // Readfirstlane
             Op::VReadfirstlane { src, .. } => vec![*src],
@@ -739,7 +741,7 @@ impl Op {
             Op::VMinF32 { dst, .. } | Op::VMinU32 { dst, .. } | Op::VMov { dst, .. } |
             Op::VMovFromSgpr { dst, .. } | Op::VAddU32 { dst, .. } |
             Op::VMulLoU32 { dst, .. } | Op::VLshlrevB32 { dst, .. } |
-            Op::VLshrrevB32 { dst, .. } | Op::VAndB32 { dst, .. } |
+            Op::VLshrrevB32 { dst, .. } | Op::VLshrrevB32Vgpr { dst, .. } | Op::VAndB32 { dst, .. } |
             Op::VXorB32 { dst, .. } | Op::VSubF32 { dst, .. } |
             Op::VSubU32 { dst, .. } | Op::VOrB32 { dst, .. } |
             Op::VRsqF32 { dst, .. } | Op::VExpF32 { dst, .. } |
@@ -827,6 +829,7 @@ impl Op {
             Op::VMulLoU32 { src0, src1, .. } => vec![*src0, *src1],
             Op::VLshlrevB32 { src, .. } |
             Op::VLshrrevB32 { src, .. } => vec![*src],
+            Op::VLshrrevB32Vgpr { shift, src, .. } => vec![*shift, *src],
             Op::VReadfirstlane { src, .. } => vec![*src],
 
             // ── 64-bit address arithmetic (CRITICAL: src0/src1 are READS even if == dst) ──

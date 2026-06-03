@@ -147,7 +147,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::VMaxF32 { .. } | Op::VMinF32 { .. } | Op::VMinU32 { .. } |
         Op::VMov { .. } | Op::VMovFromSgpr { .. } |
         Op::VAddU32 { .. } | Op::VSubU32 { .. } |
-        Op::VLshlrevB32 { .. } | Op::VLshrrevB32 { .. } |
+        Op::VLshlrevB32 { .. } | Op::VLshrrevB32 { .. } | Op::VLshrrevB32Vgpr { .. } |
         Op::VAndB32 { .. } | Op::VOrB32 { .. } | Op::VXorB32 { .. } |
         Op::VCndmaskB32 { .. } |
         Op::VAddCo { .. } | Op::VAddCoCi { .. } |

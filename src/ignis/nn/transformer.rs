@@ -279,18 +279,86 @@ impl TransformerLayer {
         }
 
         // QK-norm: per-head RMSNorm on Q and K
+        let q_pre_norm = q.to_f32_vec();
+        let k_pre_norm = k.to_f32_vec();
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
-        if dbg { eprintln!("  [L{}] Q_qknorm={:.4} K_qknorm={:.4}", layer_idx, norm(&q), norm(&k)); }
+        if dbg {
+            // CPU QK-norm reference (last token only)
+            let qn_gpu = q.to_f32_vec();
+            let kn_gpu = k.to_f32_vec();
+            let q_gamma = self.q_norm_gamma.to_f32_vec();
+            let k_gamma = self.k_norm_gamma.to_f32_vec();
+            let hd = self.d_head;
+            let last_q = (seq_len - 1) * self.q_dim;
+            let last_k = (seq_len - 1) * self.kv_dim;
+            // CPU RMSNorm per-head for Q
+            let mut cpu_q = vec![0f32; self.q_dim];
+            for head in 0..self.n_heads {
+                let base = head * hd;
+                let mut sum_sq = 0.0f32;
+                for i in 0..hd { sum_sq += q_pre_norm[last_q + base + i] * q_pre_norm[last_q + base + i]; }
+                let rms = (sum_sq / hd as f32 + 1e-6f32).sqrt();
+                for i in 0..hd { cpu_q[base + i] = q_pre_norm[last_q + base + i] / rms * q_gamma[i]; }
+            }
+            let cpu_q_norm: f32 = cpu_q.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let gpu_q_norm: f32 = qn_gpu[last_q..last_q+self.q_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let max_q_diff: f32 = cpu_q.iter().zip(qn_gpu[last_q..last_q+self.q_dim].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("  [L{}] Q_qknorm: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_q_norm, gpu_q_norm, max_q_diff);
+            // CPU RMSNorm per-head for K
+            let mut cpu_k = vec![0f32; self.kv_dim];
+            for head in 0..self.n_kv_heads {
+                let base = head * hd;
+                let mut sum_sq = 0.0f32;
+                for i in 0..hd { sum_sq += k_pre_norm[last_k + base + i] * k_pre_norm[last_k + base + i]; }
+                let rms = (sum_sq / hd as f32 + 1e-6f32).sqrt();
+                for i in 0..hd { cpu_k[base + i] = k_pre_norm[last_k + base + i] / rms * k_gamma[i]; }
+            }
+            let cpu_k_norm: f32 = cpu_k.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let gpu_k_norm: f32 = kn_gpu[last_k..last_k+self.kv_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let max_k_diff: f32 = cpu_k.iter().zip(kn_gpu[last_k..last_k+self.kv_dim].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("  [L{}] K_qknorm: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_k_norm, gpu_k_norm, max_k_diff);
+        }
 
         // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
         let q_2d = q.reshape(&[seq_len * self.n_heads, self.d_head]);
         let k_2d = k.reshape(&[seq_len * self.n_kv_heads, self.d_head]);
-        let q_2d = ops::rope::rope_forward(&q_2d, pos, self.rope_theta, &self.runtime)?;
-        let k_2d = ops::rope::rope_forward(&k_2d, pos, self.rope_theta, &self.runtime)?;
+        let q_pre_rope = q.to_f32_vec();
+        let q_2d = ops::rope::rope_forward(&q_2d, pos, self.rope_theta, self.n_heads, &self.runtime)?;
+        let k_2d = ops::rope::rope_forward(&k_2d, pos, self.rope_theta, self.n_kv_heads, &self.runtime)?;
         let q = q_2d.reshape(&[seq_len, self.q_dim]);
         let k = k_2d.reshape(&[seq_len, self.kv_dim]);
-        if dbg { eprintln!("  [L{}] Q_rope={:.4} K_rope={:.4}", layer_idx, norm(&q), norm(&k)); }
+        if dbg {
+            // CPU RoPE reference for last token, first head
+            let qd = q.to_f32_vec();
+            let kd = k.to_f32_vec();
+            let hd = self.d_head;
+            let last_q = (seq_len - 1) * self.q_dim;
+            let theta = self.rope_theta;
+            let pos_val = (pos + seq_len - 1) as f32;
+            let mut cpu_q_rope = vec![0.0f32; hd];
+            for i in 0..hd/2 {
+                let freq = pos_val / theta.powf(2.0 * i as f32 / hd as f32);
+                let cos_f = freq.cos();
+                let sin_f = freq.sin();
+                let x0 = q_pre_rope[last_q + i * 2];
+                let x1 = q_pre_rope[last_q + i * 2 + 1];
+                cpu_q_rope[i * 2] = x0 * cos_f - x1 * sin_f;
+                cpu_q_rope[i * 2 + 1] = x0 * sin_f + x1 * cos_f;
+            }
+            let cpu_q_rope_norm: f32 = cpu_q_rope.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let gpu_q_rope_norm: f32 = qd[last_q..last_q+hd].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let max_rope_diff: f32 = cpu_q_rope.iter().zip(qd[last_q..last_q+hd].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("  [L{}] Q_rope: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_q_rope_norm, gpu_q_rope_norm, max_rope_diff);
+            eprintln!("  [L{}] Q_rope[0..6]: CPU={:.4} {:.4} {:.4} {:.4} {:.4} {:.4}  GPU={:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
+                layer_idx,
+                cpu_q_rope[0], cpu_q_rope[1], cpu_q_rope[2], cpu_q_rope[3], cpu_q_rope[4], cpu_q_rope[5],
+                qd[last_q], qd[last_q+1], qd[last_q+2], qd[last_q+3], qd[last_q+4], qd[last_q+5]);
+            eprintln!("  [L{}] Q_pre_rope[0..6]: {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
+                layer_idx,
+                q_pre_rope[last_q], q_pre_rope[last_q+1], q_pre_rope[last_q+2],
+                q_pre_rope[last_q+3], q_pre_rope[last_q+4], q_pre_rope[last_q+5]);
+        }
 
         // Store K/V in cache
         let kv_heads = self.n_kv_heads;
