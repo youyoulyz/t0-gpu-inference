@@ -179,14 +179,39 @@ pub fn standard_attention(
 
         // Step 6: GPU scale + causal mask
         let t2 = std::time::Instant::now();
-        let ka = crate::kernargs![
-            gemm_out.gpu_addr() => u64,
-            scores_buf.gpu_addr() => u64,
-            kv_len as u32 => u32,
-            scale => f32
-        ];
-        let (gx, _) = ak::attn_scale_grid(seq_len as u32);
-        runtime.dispatch(&scale_kernel, [gx, 1, 1], &ka)?;
+
+        // CPU reference: scale + causal mask
+        if h == 0 {
+            let scores_raw = runtime.read_f32(&gemm_out, seq_len * kv_len);
+            let mut cpu_scaled = vec![0.0f32; seq_len * kv_len];
+            for row in 0..seq_len {
+                for col in 0..kv_len {
+                    let s = scores_raw[row * kv_len + col] * scale;
+                    cpu_scaled[row * kv_len + col] = if col <= row { s } else { f32::NEG_INFINITY };
+                }
+            }
+            // GPU scale
+            let ka = crate::kernargs![
+                gemm_out.gpu_addr() => u64,
+                scores_buf.gpu_addr() => u64,
+                kv_len as u32 => u32,
+                scale => f32
+            ];
+            let (gx, _) = ak::attn_scale_grid(seq_len as u32);
+            runtime.dispatch(&scale_kernel, [gx, 1, 1], &ka)?;
+            let gpu_scaled = runtime.read_f32(&scores_buf, seq_len * kv_len);
+            let max_diff: f32 = cpu_scaled.iter().zip(gpu_scaled.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("    [attn h={}] scale: max_diff={:.6}", h, max_diff);
+        } else {
+            let ka = crate::kernargs![
+                gemm_out.gpu_addr() => u64,
+                scores_buf.gpu_addr() => u64,
+                kv_len as u32 => u32,
+                scale => f32
+            ];
+            let (gx, _) = ak::attn_scale_grid(seq_len as u32);
+            runtime.dispatch(&scale_kernel, [gx, 1, 1], &ka)?;
+        }
         let t_scale = t2.elapsed();
 
         // Step 7: GPU softmax
@@ -223,6 +248,30 @@ pub fn standard_attention(
         };
         let t_softmax = t3.elapsed();
 
+        // CPU softmax reference for head 0
+        if h == 0 {
+            let scores_data = runtime.read_f32(&scores_buf, seq_len * kv_len);
+            let gpu_weights = runtime.read_f32(&weights_buf, seq_len * kv_len);
+            let mut cpu_weights = vec![0.0f32; seq_len * kv_len];
+            for row in 0..seq_len {
+                let mut max_val = f32::NEG_INFINITY;
+                for col in 0..kv_len {
+                    let s = scores_data[row * kv_len + col];
+                    if s.is_finite() && s > max_val { max_val = s; }
+                }
+                let mut sum = 0.0f32;
+                for col in 0..kv_len {
+                    let s = scores_data[row * kv_len + col];
+                    let e = if s.is_finite() { (s - max_val).exp() } else { 0.0 };
+                    cpu_weights[row * kv_len + col] = e;
+                    sum += e;
+                }
+                for col in 0..kv_len { cpu_weights[row * kv_len + col] /= sum; }
+            }
+            let max_diff: f32 = cpu_weights.iter().zip(gpu_weights.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("    [attn h={}] softmax: max_diff={:.6}", h, max_diff);
+        }
+
         // Step 8: GPU GEMM out_head = weights @ V_head → [seq_len, head_dim]
         let t4 = std::time::Instant::now();
         let out_head_buf = if std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
@@ -238,6 +287,27 @@ pub fn standard_attention(
             )?
         };
         let t_gemm2 = t4.elapsed();
+
+        // CPU reference for weights@V (head 0)
+        if h == 0 && std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
+            let w_data = runtime.read_f32(&weights_buf, seq_len * kv_len);
+            let v_data = runtime.read_f32(&v_head_buf, kv_len * head_dim);
+            let mut cpu_out = vec![0.0f32; seq_len * head_dim];
+            for row in 0..seq_len {
+                for col in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for kk in 0..kv_len {
+                        sum += w_data[row * kv_len + kk] * v_data[kk * head_dim + col];
+                    }
+                    cpu_out[row * head_dim + col] = sum;
+                }
+            }
+            let gpu_out = runtime.read_f32(&out_head_buf, seq_len * head_dim);
+            let max_diff: f32 = cpu_out.iter().zip(gpu_out.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let cpu_norm: f32 = cpu_out.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let gpu_norm: f32 = gpu_out.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("    [attn h=0] weights@V: CPU={:.4} GPU={:.4} max_diff={:.6}", cpu_norm, gpu_norm, max_diff);
+        }
 
         // Step 9: GPU scatter out_head → out_buf at position h
         let t5 = std::time::Instant::now();
