@@ -272,10 +272,20 @@ impl TransformerLayer {
         let q = self.wq.forward(&h)?;  // [seq, q_dim]
         let k = self.wk.forward(&h)?;  // [seq, kv_dim]
         let v = self.wv.forward(&h)?;  // [seq, kv_dim]
-        if dbg {
+        if dbg && layer_idx == 0 {
             let hd = h.to_f32_vec();
-            eprintln!("  [L{}] h_first3={:.6} {:.6} {:.6} Q={:.4} K={:.4} V={:.4}",
-                layer_idx, hd[0], hd[1], hd[2], norm(&q), norm(&k), norm(&v));
+            let qd = q.to_f32_vec();
+            let kd = k.to_f32_vec();
+            let vd = v.to_f32_vec();
+            // Last token values
+            let last_h = (seq_len - 1) * self.dim;
+            let last_q = (seq_len - 1) * self.q_dim;
+            let last_k = (seq_len - 1) * self.kv_dim;
+            let last_v = (seq_len - 1) * self.kv_dim;
+            eprintln!("  [L0] h_last[0..3]: {:.6} {:.6} {:.6}", hd[last_h], hd[last_h+1], hd[last_h+2]);
+            eprintln!("  [L0] Q_last[0..3]: {:.6} {:.6} {:.6}", qd[last_q], qd[last_q+1], qd[last_q+2]);
+            eprintln!("  [L0] K_last[0..3]: {:.6} {:.6} {:.6}", kd[last_k], kd[last_k+1], kd[last_k+2]);
+            eprintln!("  [L0] V_last[0..3]: {:.6} {:.6} {:.6}", vd[last_v], vd[last_v+1], vd[last_v+2]);
         }
 
         // QK-norm: per-head RMSNorm on Q and K
