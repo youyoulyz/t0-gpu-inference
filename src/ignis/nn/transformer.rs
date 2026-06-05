@@ -245,24 +245,17 @@ impl TransformerLayer {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = x.shape()[0];
-        let dbg = layer_idx == 0 || layer_idx == 27;
-        let norm = |t: &Tensor| -> f32 { t.to_f32_vec().iter().map(|v| v*v).sum::<f32>().sqrt() };
+        let dbg = crate::t0_debug();
 
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
-        if dbg {
-            let d = h.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] h_norm[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                d[last], d[last+1], d[last+2], d[last+3],
-                d[last+4], d[last+5], d[last+6], d[last+7]);
-        }
 
         // Q/K/V projections
-        let q = self.wq.forward(&h)?;  // [seq, q_dim]
-        let k = self.wk.forward(&h)?;  // [seq, kv_dim]
-        let v = self.wv.forward(&h)?;  // [seq, kv_dim]
-        if dbg {
+        let q = self.wq.forward(&h)?;
+        let k = self.wk.forward(&h)?;
+        let v = self.wv.forward(&h)?;
+
+        if dbg && layer_idx == 0 {
             let hd = h.to_f32_vec();
             let qd = q.to_f32_vec();
             let kd = k.to_f32_vec();
@@ -286,11 +279,9 @@ impl TransformerLayer {
         }
 
         // QK-norm: per-head RMSNorm on Q and K
-        let q_pre_norm = q.to_f32_vec();
-        let k_pre_norm = k.to_f32_vec();
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
-        if dbg {
+        if dbg && layer_idx == 0 {
             let qn = q.to_f32_vec();
             let kn = k.to_f32_vec();
             let last_q = (seq_len - 1) * self.q_dim;
@@ -306,12 +297,11 @@ impl TransformerLayer {
         // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
         let q_2d = q.reshape(&[seq_len * self.n_heads, self.d_head]);
         let k_2d = k.reshape(&[seq_len * self.n_kv_heads, self.d_head]);
-        let q_pre_rope = q.to_f32_vec();
         let q_2d = ops::rope::rope_forward(&q_2d, pos, self.rope_theta, self.n_heads, &self.runtime)?;
         let k_2d = ops::rope::rope_forward(&k_2d, pos, self.rope_theta, self.n_kv_heads, &self.runtime)?;
         let q = q_2d.reshape(&[seq_len, self.q_dim]);
         let k = k_2d.reshape(&[seq_len, self.kv_dim]);
-        if dbg {
+        if dbg && layer_idx == 0 {
             let qd = q.to_f32_vec();
             let kd = k.to_f32_vec();
             let last_q = (seq_len - 1) * self.q_dim;
@@ -330,9 +320,8 @@ impl TransformerLayer {
         let k_3d = k.reshape(&[seq_len, kv_heads, hd]);
         let v_3d = v.reshape(&[seq_len, kv_heads, hd]);
 
-        // Write K/V at the current position (same for all layers, advance once after all layers)
         let write_pos = kv_cache.position();
-        if layer_idx == 0 {
+        if dbg && layer_idx == 0 {
             eprintln!("  [L{}] kv_pos={} write_pos={} seq_len={} kv_len={}",
                 layer_idx, kv_cache.position(), write_pos, seq_len, write_pos + seq_len);
         }
@@ -342,9 +331,7 @@ impl TransformerLayer {
             kv_cache.append_many(&self.runtime, layer_idx, &k_3d, &v_3d)?;
         }
 
-        // KV length includes the newly appended tokens
         let kv_len = write_pos + seq_len;
-        // Get GPU addresses directly (bypass get_k/get_v which assert pos > 0)
         let k_addr = kv_cache.buf_gpu_addr() + kv_cache.k_offset(layer_idx, 0) as u64;
         let v_addr = kv_cache.buf_gpu_addr() + kv_cache.v_offset(layer_idx, 0) as u64;
 
@@ -357,79 +344,19 @@ impl TransformerLayer {
             self.n_heads, self.n_kv_heads, self.d_head,
             &self.runtime,
         )?;
-        if dbg {
-            let ao = attn_out.to_f32_vec();
-            let last = (seq_len - 1) * self.q_dim;
-            eprintln!("  [L0] attn_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                ao[last], ao[last+1], ao[last+2], ao[last+3],
-                ao[last+4], ao[last+5], ao[last+6], ao[last+7]);
-        }
 
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
-        if dbg {
-            let po = proj_out.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] proj_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                po[last], po[last+1], po[last+2], po[last+3],
-                po[last+4], po[last+5], po[last+6], po[last+7]);
-        }
         let x2 = ops::add::add(x, &proj_out, device)?;
-        if dbg {
-            let d = x2.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] x2[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                d[last], d[last+1], d[last+2], d[last+3],
-                d[last+4], d[last+5], d[last+6], d[last+7]);
-        }
 
         // === FFN sub-layer ===
         let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
-        if dbg {
-            let d = h2.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] h2[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                d[last], d[last+1], d[last+2], d[last+3],
-                d[last+4], d[last+5], d[last+6], d[last+7]);
-        }
         let gate = self.w_gate.forward(&h2)?;
         let up = self.w_up.forward(&h2)?;
-        if dbg {
-            let gd = gate.to_f32_vec();
-            let ud = up.to_f32_vec();
-            let last_g = (seq_len - 1) * self.ffn_dim;
-            eprintln!("  [L0] gate[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                gd[last_g], gd[last_g+1], gd[last_g+2], gd[last_g+3],
-                gd[last_g+4], gd[last_g+5], gd[last_g+6], gd[last_g+7]);
-            eprintln!("  [L0] up[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                ud[last_g], ud[last_g+1], ud[last_g+2], ud[last_g+3],
-                ud[last_g+4], ud[last_g+5], ud[last_g+6], ud[last_g+7]);
-        }
         let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-        if dbg {
-            let sd = silu_out.to_f32_vec();
-            let last = (seq_len - 1) * self.ffn_dim;
-            eprintln!("  [L0] silu[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                sd[last], sd[last+1], sd[last+2], sd[last+3],
-                sd[last+4], sd[last+5], sd[last+6], sd[last+7]);
-        }
         let ffn_out = self.w_down.forward(&silu_out)?;
-        if dbg {
-            let fd = ffn_out.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] ffn_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                fd[last], fd[last+1], fd[last+2], fd[last+3],
-                fd[last+4], fd[last+5], fd[last+6], fd[last+7]);
-        }
 
         let result = ops::add::add(&x2, &ffn_out, device)?;
-        if dbg {
-            let rd = result.to_f32_vec();
-            let last = (seq_len - 1) * self.dim;
-            eprintln!("  [L0] result[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                rd[last], rd[last+1], rd[last+2], rd[last+3],
-                rd[last+4], rd[last+5], rd[last+6], rd[last+7]);
-        }
         Ok(result)
     }
 }

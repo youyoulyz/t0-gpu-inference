@@ -46,3 +46,17 @@ pub mod ignis;
 
 // ── GPU Profiler ──
 pub mod profiler;
+
+/// Check if T0_DEBUG environment variable is set (DEBUG mode).
+/// In RELEASE mode (default), all debug readbacks and verbose logging are disabled.
+pub fn t0_debug() -> bool {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static FLAG: AtomicI8 = AtomicI8::new(-1);
+    let val = FLAG.load(Ordering::Relaxed);
+    if val >= 0 {
+        return val != 0;
+    }
+    let enabled = std::env::var("T0_DEBUG").ok().as_deref() == Some("1");
+    FLAG.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+    enabled
+}

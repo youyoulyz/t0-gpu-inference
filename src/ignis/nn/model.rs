@@ -158,10 +158,10 @@ impl LanguageModel {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
         let seq_len = ids.len();
+        let dbg = crate::t0_debug();
 
-        // Embed all tokens at once via CPU (reads weight table once)
         let mut h = self.embedding.forward_cpu(ids)?;
-        {
+        if dbg {
             let d = h.to_f32_vec();
             let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
             let last_s = (seq_len - 1) * self.config.hidden_size;
@@ -172,44 +172,34 @@ impl LanguageModel {
                 d[last_s+4], d[last_s+5], d[last_s+6], d[last_s+7]);
         }
 
-        // Run through all transformer layers with KV cache
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let h_before = {
-                let d = h.to_f32_vec();
-                d.iter().map(|x| x * x).sum::<f32>().sqrt()
-            };
             h = layer.forward_inference(&h, 0, layer_idx, kv_cache)?;
-            let d = h.to_f32_vec();
-            let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let has_nan = d.iter().any(|x| x.is_nan());
-            let last_s = (seq_len - 1) * self.config.hidden_size;
-            let last_norm: f32 = d[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("[Prefill] L{}: in={:.4} out={:.4} last={:.4} first8=[{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}] nan={}",
-                layer_idx, h_before, n, last_norm,
-                d[last_s], d[last_s+1], d[last_s+2], d[last_s+3],
-                d[last_s+4], d[last_s+5], d[last_s+6], d[last_s+7],
-                has_nan);
+            if dbg {
+                let d = h.to_f32_vec();
+                let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let has_nan = d.iter().any(|x| x.is_nan());
+                let last_s = (seq_len - 1) * self.config.hidden_size;
+                let last_norm: f32 = d[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
+                eprintln!("[Prefill] L{}: out={:.4} last={:.4} first8=[{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}] nan={}",
+                    layer_idx, n, last_norm,
+                    d[last_s], d[last_s+1], d[last_s+2], d[last_s+3],
+                    d[last_s+4], d[last_s+5], d[last_s+6], d[last_s+7],
+                    has_nan);
+            }
         }
 
-        // Advance KV cache position once after all layers have written
         kv_cache.advance_by(seq_len);
 
-        // Final RMSNorm
         h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
 
-        // Debug: check final hidden state
-        {
+        if dbg {
             let full = h.to_f32_vec();
             let n: f32 = full.iter().map(|x| x * x).sum::<f32>().sqrt();
             let last_s = (seq_len - 1) * self.config.hidden_size;
             let last_norm: f32 = full[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gamma_data = self.final_norm_gamma.to_f32_vec();
-            let gamma_norm: f32 = gamma_data.iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("[Prefill] final_hidden: total={:.4} last_tok={:.4} gamma_norm={:.4} gamma_first3={:.4} {:.4} {:.4}",
-                n, last_norm, gamma_norm, gamma_data[0], gamma_data[1], gamma_data[2]);
+            eprintln!("[Prefill] final_hidden: total={:.4} last_tok={:.4}", n, last_norm);
         }
 
-        // Take last token's hidden state: [1, hidden_size]
         let hidden = self.config.hidden_size;
         let last_hidden_data = {
             let full = h.to_f32_vec();
@@ -218,17 +208,13 @@ impl LanguageModel {
         };
         let last_hidden = Tensor::from_f32(&self.runtime, &last_hidden_data, &[1, hidden], "last_hidden")?;
 
-        // LM head → logits [1, vocab_size]
         let logits = self.lm_head.forward(&last_hidden)?;
 
-        // Debug: check logit stats
-        {
+        if dbg {
             let logits_data = logits.to_f32_vec();
             let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let min_logit = logits_data.iter().cloned().fold(f32::INFINITY, f32::min);
-            let mean_logit: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
             let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-            eprintln!("[Prefill] logits: max={:.4} (id={}) min={:.4} mean={:.4}", max_logit, max_idx, min_logit, mean_logit);
+            eprintln!("[Prefill] logits: max={:.4} (id={})", max_logit, max_idx);
         }
 
         Ok(logits)
@@ -245,23 +231,16 @@ impl LanguageModel {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
 
-        // Embed single token via CPU
         let mut h = self.embedding.forward_cpu(&[token_id])?;
-        eprintln!("[Decode] pos={} token_id={} kv_pos_before={}", pos, token_id, kv_cache.position());
 
-        // Run through all transformer layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward_inference(&h, pos, layer_idx, kv_cache)?;
         }
 
-        // Advance KV cache position once after all layers have written
         kv_cache.advance();
-        eprintln!("[Decode] kv_pos_after={}", kv_cache.position());
 
-        // Final RMSNorm
         h = ops::rmsnorm::rmsnorm(&h, &self.final_norm_gamma, device)?;
 
-        // LM head → logits [1, vocab_size]
         self.lm_head.forward(&h)
     }
 
@@ -286,16 +265,17 @@ impl LanguageModel {
         eos_id: u32,
         kv_cache: &mut super::super::kv_cache::KvCache,
     ) -> Result<Vec<u32>, String> {
+        let dbg = crate::t0_debug();
         kv_cache.reset();
 
-        // Prefill phase: process entire prompt
         eprintln!("[Generate] Prefilling {} prompt tokens...", prompt_ids.len());
         let t_prefill = std::time::Instant::now();
         let logits = self.forward_prefill(prompt_ids, kv_cache)?;
-        eprintln!("[Generate] Prefill done in {:.1}s", t_prefill.elapsed().as_secs_f64());
+        let prefill_ms = t_prefill.elapsed().as_millis();
+        eprintln!("[Generate] Prefill done in {:.1}s ({} tok/s)", prefill_ms as f64 / 1000.0,
+            prompt_ids.len() as f64 / (prefill_ms as f64 / 1000.0));
         let mut generated = Vec::new();
 
-        // Sample first token from prefill logits
         let next_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
         generated.push(next_token);
 
@@ -303,34 +283,40 @@ impl LanguageModel {
             return Ok(generated);
         }
 
-        // Decode phase: generate tokens one at a time
         let start_pos = prompt_ids.len();
         let mut current_token = next_token;
+        let mut total_decode_ms: u64 = 0;
+        let mut decode_count: u64 = 0;
         for step in 0..max_tokens - 1 {
             let t0 = std::time::Instant::now();
             let pos = start_pos + step;
             let logits = self.forward_decode(current_token, pos, kv_cache)?;
             let decode_ms = t0.elapsed().as_millis();
-
-            // Debug: show top token and logit stats
-            let logits_data = logits.to_f32_vec();
-            let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-            let mean_logit: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
+            total_decode_ms += decode_ms as u64;
+            decode_count += 1;
 
             current_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
             generated.push(current_token);
 
             if current_token == eos_id {
-                eprintln!("[Generate] EOS at step {}", step + 1);
+                if dbg { eprintln!("[Generate] EOS at step {}", step + 1); }
                 break;
             }
 
-            eprint!("[tok {}] {}ms id={} max_id={} max={:.2} mean={:.2}  ",
-                step + 1, decode_ms, current_token, max_idx, max_logit, mean_logit);
-            if (step + 1) % 5 == 0 { eprintln!(); }
+            if dbg {
+                let logits_data = logits.to_f32_vec();
+                let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max_idx = logits_data.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+                eprint!("[tok {}] {}ms id={} max_id={} max={:.2}  ",
+                    step + 1, decode_ms, current_token, max_idx, max_logit);
+                if (step + 1) % 5 == 0 { eprintln!(); }
+            }
         }
-        eprintln!("[Generate] Done. {} tokens generated.", generated.len());
+        if decode_count > 0 {
+            let avg_ms = total_decode_ms as f64 / decode_count as f64;
+            eprintln!("[Generate] Done. {} tokens generated. Avg decode: {:.1}ms/tok ({:.1} tok/s)",
+                generated.len(), avg_ms, 1000.0 / avg_ms);
+        }
 
         Ok(generated)
     }

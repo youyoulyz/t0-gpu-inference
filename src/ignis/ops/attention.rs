@@ -133,14 +133,13 @@ pub fn standard_attention(
         runtime.dispatch(&gather_kernel, [gx, 1, 1], &ka)?;
 
         // Debug: check K and V values for head 0 during decode
-        if h == 0 && seq_len == 1 {
+        if crate::t0_debug() && h == 0 && seq_len == 1 {
             let mut k_data = vec![0f32; kv_len * head_dim];
             k_head_buf.read(unsafe { std::slice::from_raw_parts_mut(k_data.as_mut_ptr() as *mut u8, kv_len * head_dim * 4) });
             let k_norm: f32 = k_data.iter().map(|x| x*x).sum::<f32>().sqrt();
             let mut v_data = vec![0f32; kv_len * head_dim];
             v_head_buf.read(unsafe { std::slice::from_raw_parts_mut(v_data.as_mut_ptr() as *mut u8, kv_len * head_dim * 4) });
             let v_norm: f32 = v_data.iter().map(|x| x*x).sum::<f32>().sqrt();
-            // Check last K entry (the newly written one)
             let last_k = (kv_len - 1) * head_dim;
             let prev_k = if kv_len > 1 { (kv_len - 2) * head_dim } else { 0 };
             eprintln!("    [attn decode h=0] kv_len={} K_norm={:.4} V_norm={:.4} K_last[0..3]={:.4} {:.4} {:.4} {:.4} K_prev[0..3]={:.4} {:.4} {:.4} {:.4}",
@@ -180,8 +179,8 @@ pub fn standard_attention(
         // Step 6: GPU scale + causal mask
         let t2 = std::time::Instant::now();
 
-        // CPU reference: scale + causal mask
-        if h == 0 {
+        // CPU reference: scale + causal mask (debug only)
+        if crate::t0_debug() && h == 0 {
             let scores_raw = runtime.read_f32(&gemm_out, seq_len * kv_len);
             let mut cpu_scaled = vec![0.0f32; seq_len * kv_len];
             for row in 0..seq_len {
@@ -248,8 +247,8 @@ pub fn standard_attention(
         };
         let t_softmax = t3.elapsed();
 
-        // CPU softmax reference for head 0
-        if h == 0 {
+        // CPU softmax reference for head 0 (debug only)
+        if crate::t0_debug() && h == 0 {
             let scores_data = runtime.read_f32(&scores_buf, seq_len * kv_len);
             let gpu_weights = runtime.read_f32(&weights_buf, seq_len * kv_len);
             let mut cpu_weights = vec![0.0f32; seq_len * kv_len];
@@ -288,8 +287,8 @@ pub fn standard_attention(
         };
         let t_gemm2 = t4.elapsed();
 
-        // CPU reference for weights@V (head 0)
-        if h == 0 && std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
+        // CPU reference for weights@V (debug only)
+        if crate::t0_debug() && h == 0 && std::env::var("T0_F32_GEMM").ok().as_deref() == Some("1") {
             let w_data = runtime.read_f32(&weights_buf, seq_len * kv_len);
             let v_data = runtime.read_f32(&v_head_buf, kv_len * head_dim);
             let mut cpu_out = vec![0.0f32; seq_len * head_dim];
@@ -323,10 +322,12 @@ pub fn standard_attention(
         runtime.dispatch(&scatter_kernel, [gx, 1, 1], &ka)?;
         let t_scatter = t5.elapsed();
 
-        eprintln!("  [Attn] h={} gather={:.1}ms gemm_qk={:.1}ms scale={:.1}ms softmax={:.1}ms gemm_wv={:.1}ms scatter={:.1}ms",
-            h, t_gather.as_secs_f64()*1000.0, t_gemm.as_secs_f64()*1000.0,
-            t_scale.as_secs_f64()*1000.0, t_softmax.as_secs_f64()*1000.0,
-            t_gemm2.as_secs_f64()*1000.0, t_scatter.as_secs_f64()*1000.0);
+        if crate::t0_debug() {
+            eprintln!("  [Attn] h={} gather={:.1}ms gemm_qk={:.1}ms scale={:.1}ms softmax={:.1}ms gemm_wv={:.1}ms scatter={:.1}ms",
+                h, t_gather.as_secs_f64()*1000.0, t_gemm.as_secs_f64()*1000.0,
+                t_scale.as_secs_f64()*1000.0, t_softmax.as_secs_f64()*1000.0,
+                t_gemm2.as_secs_f64()*1000.0, t_scatter.as_secs_f64()*1000.0);
+        }
     }
 
     Ok(Tensor::from_buffer(Arc::new(out_buf), runtime,
