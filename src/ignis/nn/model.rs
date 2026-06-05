@@ -227,7 +227,7 @@ impl LanguageModel {
     ) -> Result<Tensor, String> {
         let device = &self.runtime.device;
 
-        let mut h = self.embedding.forward_cpu(&[token_id])?;
+        let mut h = self.embedding.forward_gpu(&[token_id])?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward_inference(&h, pos, layer_idx, kv_cache)?;

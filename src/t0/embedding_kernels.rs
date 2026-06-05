@@ -130,6 +130,56 @@ pub fn cpu_embedding_backward(
 pub fn embedding_grid(num_tokens: u32) -> (u32, u32) { (num_tokens * WG_SIZE, 1) }
 pub fn embedding_wg_size() -> u32 { WG_SIZE }
 
+/// Build embedding gather kernel for decode: BF16 table → F32 output.
+///
+/// Each WG processes one token. Each thread loads one BF16 element
+/// from the weight table row and stores it as F32.
+/// Supports dim > WG_SIZE via multi-pass (for_range).
+///
+/// Kernarg layout: [table:u64, output:u64, token_id:u32, dim:u32]
+/// Grid: (1 * WG_SIZE, 1, 1) — one WG for one token
+pub fn build_embedding_gather_bf16() -> BlockKernel {
+    let mut kb = BlockKernel::new("emb_gather_bf16", WG_SIZE);
+
+    let table_ptr = kb.arg_ptr("table");
+    let output_ptr = kb.arg_ptr("output");
+    let token_id = kb.arg_u32("token_id");
+    let dim = kb.arg_u32("dim");
+
+    let tid = kb.thread_id();
+    let zero = kb.const_u32(0);
+
+    let row_offset = token_id.mul(&mut kb, dim);
+
+    let iter = kb.for_range(zero, dim, WG_SIZE);
+    {
+        let col = iter.add(&mut kb, tid);
+        let mask = col.lt(&mut kb, dim);
+        let src_offset = row_offset.add(&mut kb, col);
+        let val = kb.load_bf16(table_ptr, src_offset, mask);
+        kb.store(output_ptr, col, val, mask);
+    }
+    kb.end_for(iter);
+
+    kb
+}
+
+/// CPU reference: embedding gather BF16→F32 for single token
+/// Input is raw BF16 bytes (2 bytes per element, little-endian).
+pub fn cpu_embedding_gather_bf16(
+    table_bf16_bytes: &[u8], token_id: u32, dim: usize,
+) -> Vec<f32> {
+    let row_start = (token_id as usize) * dim * 2;
+    let mut out = Vec::with_capacity(dim);
+    for i in 0..dim {
+        let offset = row_start + i * 2;
+        let bits = u16::from_le_bytes([table_bf16_bytes[offset], table_bf16_bytes[offset + 1]]);
+        let f32_bits = (bits as u32) << 16;
+        out.push(f32::from_bits(f32_bits));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +229,77 @@ mod tests {
         assert!(!ck.elf.is_empty());
         eprintln!("✓ Embedding backward: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
+    }
+
+    #[test]
+    fn test_embedding_gather_bf16_compiles() {
+        let kb = build_embedding_gather_bf16();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("embedding gather bf16 compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ Embedding gather BF16: {} bytes ELF, wg={:?}, lds={}",
+            ck.elf.len(), ck.workgroup_size, ck.lds_size);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_embedding_gather_bf16_gpu() {
+        use crate::ignis::gpu_context::GpuRuntime;
+        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use std::sync::{Arc, OnceLock};
+
+        struct SyncRt(Arc<GpuRuntime>);
+        unsafe impl Sync for SyncRt {}
+        unsafe impl Send for SyncRt {}
+        static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+
+        let rt = GPU_RT.get_or_init(|| {
+            SyncRt(GpuRuntime::new().expect("GPU runtime"))
+        }).0.clone();
+        let _ = rt.wait_idle();
+
+        let vocab_size: u32 = 256;
+        let dim: u32 = 128;
+        let token_id: u32 = 42;
+
+        let table_f32: Vec<f32> = (0..vocab_size * dim).map(|i| (i as f32 * 0.01)).collect();
+
+        let mut table_bf16_bytes = Vec::with_capacity((vocab_size * dim) as usize * 2);
+        for &v in &table_f32 {
+            let bits = v.to_bits();
+            let bf16_bits = (bits >> 16) as u16;
+            table_bf16_bytes.extend_from_slice(&bf16_bits.to_le_bytes());
+        }
+
+        let expected = cpu_embedding_gather_bf16(&table_bf16_bytes, token_id, dim as usize);
+
+        let table_buf = rt.device.alloc_vram(table_bf16_bytes.len()).unwrap();
+        table_buf.write_bytes(0, &table_bf16_bytes);
+
+        let output_buf = rt.alloc_f32(dim as usize).unwrap();
+
+        let kb = build_embedding_gather_bf16();
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
+            workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
+        }).expect("load");
+
+        let ka = crate::kernargs![
+            table_buf.gpu_addr() => u64,
+            output_buf.gpu_addr() => u64,
+            token_id => u32,
+            dim => u32
+        ];
+        rt.dispatch(&kernel, [256, 1, 1], &ka).expect("dispatch");
+
+        let gpu_output = rt.read_f32(&output_buf, dim as usize);
+        let mut max_err: f32 = 0.0;
+        for i in 0..dim as usize {
+            let err = (gpu_output[i] - expected[i]).abs();
+            max_err = max_err.max(err);
+        }
+        assert!(max_err < 0.01, "Embedding gather BF16 max_err={}", max_err);
+        let _ = rt.wait_idle();
+        eprintln!("✓ Embedding gather BF16 GPU: token_id={}, dim={}, max_err={:.2e}", token_id, dim, max_err);
     }
 
     #[cfg(feature = "rocm")]

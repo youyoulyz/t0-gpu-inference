@@ -314,11 +314,8 @@ fn translate_node(
             let idx = get(offsets)?;
             let m = get(mask)?;
             let zero = f.const_u32(0);
-            // Load as BF16 (16-bit), result is BF16-typed vector
             let bf16_val = f.load_masked(p, idx, m, zero, ScalarDType::BF16);
-            // Convert BF16→F32: shift left 16 bits
-            let sixteen = f.const_u32(16);
-            Ok(Some(f.binop_raw(BinOpKind::Shl, bf16_val, sixteen)))
+            Ok(Some(f.cast(bf16_val, ScalarDType::F32)))
         }
         BNode::StoreBf16 { ptr, offsets, val, mask } => {
             let p = get(ptr)?;
@@ -336,11 +333,8 @@ fn translate_node(
         BNode::CvtF32U32(a) => Ok(Some(f.cast(get(a)?, ScalarDType::F32))),
         BNode::CvtU32F32(a) => Ok(Some(f.cast(get(a)?, ScalarDType::U32))),
         BNode::CvtF32BF16(a) => {
-            // bf16 → f32: bf16 value stored in lower 16 bits of u32
-            // Simply shift left 16 bits to get the f32 bit pattern
             let src = get(a)?;
-            let sixteen = f.const_u32(16);
-            Ok(Some(f.binop_raw(BinOpKind::Shl, src, sixteen)))
+            Ok(Some(f.cast(src, ScalarDType::F32)))
         }
 
         // ── Wave reductions ──

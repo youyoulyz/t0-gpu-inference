@@ -65,27 +65,30 @@ impl Embedding {
     }
 
     /// GPU-based forward: gather rows by token IDs on GPU.
-    /// For decode (1 token), uses zero-copy view into the weight table.
-    /// For prefill (>1 tokens), uses GPU gather kernel.
+    /// For decode (1 token), uses BF16→F32 gather kernel (1 dispatch).
+    /// For prefill (>1 tokens), falls back to CPU (embedding gather kernel
+    /// has SSA compile issue with scalar program_id indices).
     pub fn forward_gpu(&self, ids: &[u32]) -> Result<Tensor, String> {
         if ids.len() == 1 {
-            let token_id = ids[0] as u64;
-            let row_addr = self.weight.gpu_addr() + token_id * (self.dim as u64) * 4;
-            Ok(Tensor::from_gpu_addr(row_addr, &self.runtime, &[1, self.dim], "emb_out"))
+            let token_id = ids[0];
+            let out_buf = self.runtime.alloc_f32(self.dim)?;
+
+            let kernel = self.runtime.ensure_kernel_blockdsl("emb_gather_bf16", || {
+                crate::t0::embedding_kernels::build_embedding_gather_bf16()
+            })?;
+
+            let ka = crate::kernargs![
+                self.weight.gpu_addr() => u64,
+                out_buf.gpu_addr() => u64,
+                token_id => u32,
+                self.dim as u32 => u32
+            ];
+            self.runtime.dispatch(&kernel, [256, 1, 1], &ka)?;
+
+            let out_arc = std::sync::Arc::new(out_buf);
+            Ok(Tensor::from_buffer(out_arc, &self.runtime, &[1, self.dim], super::super::tensor::DType::F32, "emb_out"))
         } else {
-            let seq_len = ids.len();
-            let ids_buf = {
-                let bytes = seq_len * 4;
-                let buf = self.runtime.device.alloc_vram(bytes)?;
-                let byte_slice = unsafe {
-                    std::slice::from_raw_parts(ids.as_ptr() as *const u8, bytes)
-                };
-                buf.write_bytes(0, byte_slice);
-                buf
-            };
-            ops::embedding::embedding_forward(
-                &self.weight, &ids_buf, seq_len, self.dim, &self.runtime,
-            )
+            self.forward_cpu(ids)
         }
     }
 
