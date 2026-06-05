@@ -336,6 +336,69 @@ pub fn standard_attention(
         super::super::tensor::DType::F32, "attn_out"))
 }
 
+/// Flash Attention for decode (seq_len=1).
+///
+/// Fuses Q@K^T + online softmax + weighted-V accumulation into a single
+/// GPU dispatch per decode step, replacing ~176 dispatches/layer with 1.
+///
+/// # Arguments
+/// - `q`: [1, n_heads * head_dim] f32
+/// - `k`: [kv_len, n_kv_heads * head_dim] f32 (from KV cache)
+/// - `v`: [kv_len, n_kv_heads * head_dim] f32 (from KV cache)
+/// - `n_heads`: number of query heads
+/// - `n_kv_heads`: number of key/value heads (GQA)
+/// - `head_dim`: dimension per head
+/// - `runtime`: GPU runtime
+#[cfg(feature = "rocm")]
+pub fn flash_attention_decode(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    runtime: &Arc<GpuRuntime>,
+) -> Result<Tensor, String> {
+    crate::profile_scope!("flash_attention_decode");
+    use crate::t0::flash_attn_kernels as fak;
+
+    let q_shape = q.shape();
+    let k_shape = k.shape();
+    assert_eq!(q_shape[0], 1, "flash_attention_decode requires seq_len=1");
+    assert_eq!(q_shape[1], n_heads * head_dim);
+    assert_eq!(k_shape[1], n_kv_heads * head_dim);
+
+    let kv_len = k_shape[0];
+    let gqa_ratio_log2 = (n_heads / n_kv_heads).trailing_zeros() as u8;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let kv_stride = (n_kv_heads * head_dim) as u32;
+
+    let kernel_name = format!("flash_attn_decode_{}_gqa{}", head_dim, n_heads / n_kv_heads);
+    let kernel = runtime.ensure_kernel_blockdsl(&kernel_name, || {
+        fak::build_flash_attn_decode(head_dim as u32, gqa_ratio_log2)
+    })?;
+
+    let out_buf = runtime.alloc_f32(n_heads * head_dim)?;
+
+    let ka = crate::kernargs![
+        q.buffer_arc().gpu_addr() => u64,
+        k.buffer_arc().gpu_addr() => u64,
+        v.buffer_arc().gpu_addr() => u64,
+        out_buf.gpu_addr() => u64,
+        scale => f32,
+        head_dim as u32 => u32,
+        kv_len as u32 => u32,
+        kv_stride => u32
+    ];
+
+    let (gx, _) = fak::flash_attn_decode_grid(n_heads as u32, head_dim as u32);
+    runtime.dispatch(&kernel, [gx, 1, 1], &ka)?;
+
+    Ok(Tensor::from_buffer(Arc::new(out_buf), runtime,
+        &[1, n_heads * head_dim],
+        super::super::tensor::DType::F32, "flash_attn_out"))
+}
+
 /// CPU reference: scaled dot-product attention (for testing).
 pub fn cpu_attention(
     q: &[f32],
@@ -787,6 +850,89 @@ mod tests {
             }
             eprintln!("Zero-copy vs CPU-upload max error: {:.8}", max_err);
             assert!(max_err < 1e-5, "Zero-copy mismatch: max_err={}", max_err);
+        }
+
+        #[test]
+        fn test_gpu_flash_attn_decode_small() {
+            let r = rt();
+            let head_dim = 64;
+            let n_heads = 4;
+            let n_kv_heads = 2;
+            let kv_len = 5;
+
+            let mut rng_state = 42u64;
+            let mut rand = || -> f32 {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.5
+            };
+
+            let q_data: Vec<f32> = (0..n_heads * head_dim).map(|_| rand()).collect();
+            let k_data: Vec<f32> = (0..kv_len * n_kv_heads * head_dim).map(|_| rand()).collect();
+            let v_data: Vec<f32> = (0..kv_len * n_kv_heads * head_dim).map(|_| rand()).collect();
+
+            let q = Tensor::from_f32(&r, &q_data, &[1, n_heads * head_dim], "q").unwrap();
+            let k = Tensor::from_f32(&r, &k_data, &[kv_len, n_kv_heads * head_dim], "k").unwrap();
+            let v = Tensor::from_f32(&r, &v_data, &[kv_len, n_kv_heads * head_dim], "v").unwrap();
+
+            let gpu_out = flash_attention_decode(
+                &q, &k, &v, n_heads, n_kv_heads, head_dim, &r,
+            ).unwrap();
+            let gpu_data = gpu_out.to_f32_vec();
+
+            let cpu_data = crate::t0::flash_attn_kernels::cpu_flash_attn_decode(
+                &q_data, &k_data, &v_data, n_heads, n_kv_heads, head_dim, kv_len,
+            );
+
+            let mut max_err: f32 = 0.0;
+            for i in 0..n_heads * head_dim {
+                let err = (gpu_data[i] - cpu_data[i]).abs();
+                max_err = max_err.max(err);
+            }
+            eprintln!("GPU flash attn decode (small): max_err={:.6}", max_err);
+            assert!(max_err < 0.1, "max_err={}", max_err);
+        }
+
+        #[test]
+        fn test_gpu_flash_attn_decode_qwen_scale() {
+            let r = rt();
+            let head_dim = 128;
+            let n_heads = 16;
+            let n_kv_heads = 8;
+            let kv_len = 16;
+
+            let mut rng_state = 42u64;
+            let mut rand = || -> f32 {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng_state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.5
+            };
+
+            let q_data: Vec<f32> = (0..n_heads * head_dim).map(|_| rand()).collect();
+            let k_data: Vec<f32> = (0..kv_len * n_kv_heads * head_dim).map(|_| rand()).collect();
+            let v_data: Vec<f32> = (0..kv_len * n_kv_heads * head_dim).map(|_| rand()).collect();
+
+            let q = Tensor::from_f32(&r, &q_data, &[1, n_heads * head_dim], "q").unwrap();
+            let k = Tensor::from_f32(&r, &k_data, &[kv_len, n_kv_heads * head_dim], "k").unwrap();
+            let v = Tensor::from_f32(&r, &v_data, &[kv_len, n_kv_heads * head_dim], "v").unwrap();
+
+            let gpu_out = flash_attention_decode(
+                &q, &k, &v, n_heads, n_kv_heads, head_dim, &r,
+            ).unwrap();
+            let gpu_data = gpu_out.to_f32_vec();
+
+            let cpu_data = crate::t0::flash_attn_kernels::cpu_flash_attn_decode(
+                &q_data, &k_data, &v_data, n_heads, n_kv_heads, head_dim, kv_len,
+            );
+
+            let mut max_err: f32 = 0.0;
+            let mut max_rel: f32 = 0.0;
+            for i in 0..n_heads * head_dim {
+                let err = (gpu_data[i] - cpu_data[i]).abs();
+                let rel = if cpu_data[i].abs() > 1e-6 { err / cpu_data[i].abs() } else { 0.0 };
+                max_err = max_err.max(err);
+                max_rel = max_rel.max(rel);
+            }
+            eprintln!("GPU flash attn decode (qwen): max_err={:.6} max_rel={:.2}%", max_err, max_rel * 100.0);
+            assert!(max_rel < 0.05, "max_rel={:.2}%", max_rel * 100.0);
         }
     }
 }

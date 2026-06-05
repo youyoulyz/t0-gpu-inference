@@ -364,12 +364,20 @@ impl TransformerLayer {
         let k_cache = Tensor::from_gpu_addr(k_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
         let v_cache = Tensor::from_gpu_addr(v_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
 
-        // Standard scaled dot-product attention with GQA
-        let attn_out = ops::attention::standard_attention(
-            &q, &k_cache, &v_cache,
-            self.n_heads, self.n_kv_heads, self.d_head,
-            &self.runtime,
-        )?;
+        // Attention — flash for decode, standard for prefill
+        let attn_out = if seq_len == 1 {
+            ops::attention::flash_attention_decode(
+                &q, &k_cache, &v_cache,
+                self.n_heads, self.n_kv_heads, self.d_head,
+                &self.runtime,
+            )?
+        } else {
+            ops::attention::standard_attention(
+                &q, &k_cache, &v_cache,
+                self.n_heads, self.n_kv_heads, self.d_head,
+                &self.runtime,
+            )?
+        };
 
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
