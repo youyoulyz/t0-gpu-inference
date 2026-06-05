@@ -64,6 +64,31 @@ impl Embedding {
         )
     }
 
+    /// GPU-based forward: gather rows by token IDs on GPU.
+    /// For decode (1 token), uses zero-copy view into the weight table.
+    /// For prefill (>1 tokens), uses GPU gather kernel.
+    pub fn forward_gpu(&self, ids: &[u32]) -> Result<Tensor, String> {
+        if ids.len() == 1 {
+            let token_id = ids[0] as u64;
+            let row_addr = self.weight.gpu_addr() + token_id * (self.dim as u64) * 4;
+            Ok(Tensor::from_gpu_addr(row_addr, &self.runtime, &[1, self.dim], "emb_out"))
+        } else {
+            let seq_len = ids.len();
+            let ids_buf = {
+                let bytes = seq_len * 4;
+                let buf = self.runtime.device.alloc_vram(bytes)?;
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts(ids.as_ptr() as *const u8, bytes)
+                };
+                buf.write_bytes(0, byte_slice);
+                buf
+            };
+            ops::embedding::embedding_forward(
+                &self.weight, &ids_buf, seq_len, self.dim, &self.runtime,
+            )
+        }
+    }
+
     /// Simple CPU-based forward for testing.
     /// Records backward on tape so embedding gets gradients.
     pub fn forward_cpu(&self, ids: &[u32]) -> Result<Tensor, String> {
