@@ -57,6 +57,7 @@ pub struct TransformerLayer {
     pub ffn_dim: usize,
     pub rope_theta: f32,
     wqkv_bf16: std::sync::OnceLock<Option<crate::kfd::GpuBuffer>>,
+    wgu_bf16: std::sync::OnceLock<Option<crate::kfd::GpuBuffer>>,
     runtime: Arc<GpuRuntime>,
 }
 
@@ -122,6 +123,7 @@ impl TransformerLayer {
             ffn_dim,
             rope_theta: config.rope_theta,
             wqkv_bf16: std::sync::OnceLock::new(),
+            wgu_bf16: std::sync::OnceLock::new(),
             runtime: runtime.clone(),
         })
     }
@@ -179,6 +181,7 @@ impl TransformerLayer {
             ffn_dim,
             rope_theta: 10000.0,
             wqkv_bf16: std::sync::OnceLock::new(),
+            wgu_bf16: std::sync::OnceLock::new(),
             runtime: runtime.clone(),
         })
     }
@@ -231,6 +234,10 @@ impl TransformerLayer {
 
     pub fn set_wqkv_bf16(&self, buf: crate::kfd::GpuBuffer) {
         let _ = self.wqkv_bf16.set(Some(buf));
+    }
+
+    pub fn set_wgu_bf16(&self, buf: crate::kfd::GpuBuffer) {
+        let _ = self.wgu_bf16.set(Some(buf));
     }
 
     /// Inference forward pass with RoPE, QK-norm, standard attention, and KV cache.
@@ -385,8 +392,26 @@ impl TransformerLayer {
 
         // === FFN sub-layer ===
         let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
-        let gate = self.w_gate.forward(&h2)?;
-        let up = self.w_up.forward(&h2)?;
+
+        let (gate, up, _gu_holder) = if seq_len == 1 {
+            if let Some(Some(wt)) = self.wgu_bf16.get() {
+                let n_fused = 2 * self.ffn_dim;
+                let gu = ops::bf16_matmul::matmul_with_wt_bf16(
+                    &h2, wt, 1, self.dim, n_fused, &self.runtime,
+                )?;
+                let base = gu.gpu_addr();
+                let gate = Tensor::from_gpu_addr(base, &self.runtime, &[1, self.ffn_dim], "gate_fused");
+                let up = Tensor::from_gpu_addr(
+                    base + (self.ffn_dim * 4) as u64, &self.runtime, &[1, self.ffn_dim], "up_fused",
+                );
+                (gate, up, Some(gu))
+            } else {
+                (self.w_gate.forward(&h2)?, self.w_up.forward(&h2)?, None)
+            }
+        } else {
+            (self.w_gate.forward(&h2)?, self.w_up.forward(&h2)?, None)
+        };
+
         let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
         let ffn_out = self.w_down.forward(&silu_out)?;
 

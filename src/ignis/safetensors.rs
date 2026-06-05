@@ -541,6 +541,41 @@ pub fn load_qwen3_into_model(
             }
         }
 
+        // Fused Gate+Up: concatenate gate/up bf16 weights [N,K] → [N_fused,K] and pad for GEMM
+        {
+            let gate_key = format!("{}.mlp.gate_proj.weight", prefix);
+            let up_key = format!("{}.mlp.up_proj.weight", prefix);
+            if let (Some(gate_t), Some(up_t)) =
+                (all_tensors.get(&gate_key), all_tensors.get(&up_key))
+            {
+                let gate_shape = gate_t.shape();
+                let gate_n = gate_shape[0];
+                let k_dim = gate_shape[1];
+
+                let _ = runtime.wait_idle();
+                let row_bytes = k_dim * 2;
+
+                let mut gate_raw = vec![0u8; gate_n * row_bytes];
+                let mut up_raw = vec![0u8; gate_n * row_bytes];
+                gate_t.buffer().read(&mut gate_raw);
+                up_t.buffer().read(&mut up_raw);
+
+                let n_fused = 2 * gate_n;
+                let mut fused_raw = vec![0u8; n_fused * row_bytes];
+                fused_raw[..gate_n * row_bytes].copy_from_slice(&gate_raw);
+                fused_raw[gate_n * row_bytes..].copy_from_slice(&up_raw);
+
+                let fused_buf = runtime.device.alloc_vram(fused_raw.len())?;
+                fused_buf.write_bytes(0, &fused_raw);
+
+                let wt_bf16 = crate::ignis::ops::bf16_matmul::precompute_wt_bf16_from_raw(
+                    runtime, &fused_buf, n_fused, k_dim,
+                )?;
+                layer.set_wgu_bf16(wt_bf16);
+                eprintln!("[Safetensors] L{}: fused Gate+Up bf16 [{}] → [{}]", layer_idx, n_fused, k_dim);
+            }
+        }
+
         eprintln!("[Safetensors] Assigned layer {}", layer_idx);
     }
 
