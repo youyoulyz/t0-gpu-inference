@@ -144,7 +144,8 @@ impl Tensor {
         shape: &[usize],
         label: &str,
     ) -> Self {
-        let buf = crate::kfd::GpuBuffer::new_view(gpu_addr, runtime.device.clone());
+        let size: usize = shape.iter().product::<usize>() * 4;
+        let buf = crate::kfd::GpuBuffer::new_view(gpu_addr, size, runtime.device.clone());
         Tensor {
             id: next_tensor_id(),
             buf: Arc::new(buf),

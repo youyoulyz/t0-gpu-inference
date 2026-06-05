@@ -1097,12 +1097,12 @@ impl GpuBuffer {
     /// Create a non-owning view from a raw GPU virtual address.
     /// handle=0 means Drop won't free the memory. host_ptr is set to null
     /// since the caller manages the underlying memory.
-    pub fn new_view(gpu_addr: u64, device: Arc<KfdDevice>) -> GpuBuffer {
+    pub fn new_view(gpu_addr: u64, size: usize, device: Arc<KfdDevice>) -> GpuBuffer {
         GpuBuffer {
             handle: 0,
             va_addr: gpu_addr,
-            host_ptr: std::ptr::null_mut(),
-            size: 0,
+            host_ptr: gpu_addr as *mut u8,
+            size,
             device,
         }
     }

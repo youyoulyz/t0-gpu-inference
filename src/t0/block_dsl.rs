@@ -155,6 +155,7 @@ pub enum BNode {
     RsqrtF32(BVal),           // 1/sqrt(x) (hardware)
     AbsF32(BVal),             // |x| (clear sign bit)
     NegF32(BVal),
+    SiluF32(BVal),            // x * σ(x) — fused, avoids RA spill of self across sigmoid
     SinF32(BVal),             // sin(x) (hardware, computes sin(2π·x))
     CosF32(BVal),             // cos(x) (hardware, computes cos(2π·x))
     DivF32(BVal, BVal),       // a / b (rcp + mul)
@@ -284,7 +285,7 @@ impl BNode {
             BNode::Arange { .. } => BType::U32,
             BNode::AddF32(..) | BNode::MulF32(..) | BNode::SubF32(..) => BType::F32,
             BNode::ExpF32(_) | BNode::Log2F32(_) | BNode::SqrtF32(_) => BType::F32,
-            BNode::RcpF32(_) | BNode::RsqrtF32(_) | BNode::AbsF32(_) | BNode::NegF32(_) => BType::F32,
+            BNode::RcpF32(_) | BNode::RsqrtF32(_) | BNode::AbsF32(_) | BNode::NegF32(_) | BNode::SiluF32(_) => BType::F32,
             BNode::SinF32(_) | BNode::CosF32(_) | BNode::DivF32(..) => BType::F32,
             BNode::MaxF32(..) | BNode::MinF32(..) | BNode::FmaF32(..) => BType::F32,
             BNode::AddU32(..) | BNode::SubU32(..) | BNode::MulU32(..) => BType::U32,
@@ -490,10 +491,9 @@ impl BVal {
         scaled.sub(kb, one)
     }
 
-    /// SiLU: silu(x) = x * σ(x)
+    /// SiLU: silu(x) = x * σ(x) — fused single node to avoid RA spill
     pub fn silu(self, kb: &mut BlockKernel) -> BVal {
-        let sig = self.sigmoid(kb);
-        self.mul(kb, sig)
+        kb.push(BNode::SiluF32(self))
     }
 
     /// GELU (approximation): x * 0.5 * (1 + tanh(sqrt(2/π)(x + 0.044715*x³)))

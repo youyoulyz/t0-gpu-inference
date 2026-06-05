@@ -217,6 +217,7 @@ fn translate_node(
         BNode::RsqrtF32(a) => Ok(Some(f.rsqrt(get(a)?))),
         BNode::AbsF32(a)  => Ok(Some(f.abs(get(a)?))),
         BNode::NegF32(a)  => Ok(Some(f.neg(get(a)?))),
+        BNode::SiluF32(a) => Ok(Some(f.silu(get(a)?))),
         BNode::SinF32(a)  => Ok(Some(f.sin(get(a)?))),
         BNode::CosF32(a)  => Ok(Some(f.cos(get(a)?))),
         BNode::DivF32(a, b) => Ok(Some(f.div(get(a)?, get(b)?))),

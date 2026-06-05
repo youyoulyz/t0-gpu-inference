@@ -81,7 +81,8 @@ fn main() {
         for rank in 0..10.min(indexed.len()) {
             let id = indexed[rank].0;
             let val = indexed[rank].1;
-            eprintln!("    rank={}: id={} logit={:.4}", rank, id, val);
+            let text = tokenizer.decode(&[id as u32]);
+            eprintln!("    rank={}: id={} logit={:.4} text={:?}", rank, id, val, text);
         }
         // Stats
         let max_logit = indexed[0].1;

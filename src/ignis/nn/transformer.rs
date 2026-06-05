@@ -252,40 +252,37 @@ impl TransformerLayer {
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
         if dbg {
             let d = h.to_f32_vec();
-            // CPU RMSNorm reference
-            let xd = x.to_f32_vec();
-            let gamma = self.attn_norm_gamma.to_f32_vec();
-            let dim = self.dim;
-            let mut cpu_h = vec![0f32; seq_len * dim];
-            for t in 0..seq_len {
-                let mut sum_sq = 0.0f32;
-                for i in 0..dim { sum_sq += xd[t * dim + i] * xd[t * dim + i]; }
-                let rms = (sum_sq / dim as f32 + 1e-6f32).sqrt();
-                for i in 0..dim { cpu_h[t * dim + i] = xd[t * dim + i] / rms * gamma[i]; }
-            }
-            let max_diff: f32 = cpu_h.iter().zip(d.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            let mean_diff: f32 = cpu_h.iter().zip(d.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>() / (seq_len * dim) as f32;
-            eprintln!("  [L{}] h_norm: GPU={:.4} CPU={:.4} max_diff={:.6} mean_diff={:.8}", layer_idx, norm(&h), cpu_h.iter().map(|x| x*x).sum::<f32>().sqrt(), max_diff, mean_diff);
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] h_norm[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                d[last], d[last+1], d[last+2], d[last+3],
+                d[last+4], d[last+5], d[last+6], d[last+7]);
         }
 
         // Q/K/V projections
         let q = self.wq.forward(&h)?;  // [seq, q_dim]
         let k = self.wk.forward(&h)?;  // [seq, kv_dim]
         let v = self.wv.forward(&h)?;  // [seq, kv_dim]
-        if dbg && layer_idx == 0 {
+        if dbg {
             let hd = h.to_f32_vec();
             let qd = q.to_f32_vec();
             let kd = k.to_f32_vec();
             let vd = v.to_f32_vec();
-            // Last token values
             let last_h = (seq_len - 1) * self.dim;
             let last_q = (seq_len - 1) * self.q_dim;
             let last_k = (seq_len - 1) * self.kv_dim;
             let last_v = (seq_len - 1) * self.kv_dim;
-            eprintln!("  [L0] h_last[0..3]: {:.6} {:.6} {:.6}", hd[last_h], hd[last_h+1], hd[last_h+2]);
-            eprintln!("  [L0] Q_last[0..3]: {:.6} {:.6} {:.6}", qd[last_q], qd[last_q+1], qd[last_q+2]);
-            eprintln!("  [L0] K_last[0..3]: {:.6} {:.6} {:.6}", kd[last_k], kd[last_k+1], kd[last_k+2]);
-            eprintln!("  [L0] V_last[0..3]: {:.6} {:.6} {:.6}", vd[last_v], vd[last_v+1], vd[last_v+2]);
+            eprintln!("  [L0] h_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                hd[last_h], hd[last_h+1], hd[last_h+2], hd[last_h+3],
+                hd[last_h+4], hd[last_h+5], hd[last_h+6], hd[last_h+7]);
+            eprintln!("  [L0] Q_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                qd[last_q], qd[last_q+1], qd[last_q+2], qd[last_q+3],
+                qd[last_q+4], qd[last_q+5], qd[last_q+6], qd[last_q+7]);
+            eprintln!("  [L0] K_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                kd[last_k], kd[last_k+1], kd[last_k+2], kd[last_k+3],
+                kd[last_k+4], kd[last_k+5], kd[last_k+6], kd[last_k+7]);
+            eprintln!("  [L0] V_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                vd[last_v], vd[last_v+1], vd[last_v+2], vd[last_v+3],
+                vd[last_v+4], vd[last_v+5], vd[last_v+6], vd[last_v+7]);
         }
 
         // QK-norm: per-head RMSNorm on Q and K
@@ -294,40 +291,16 @@ impl TransformerLayer {
         let q = ops::qk_norm::qk_norm(&q, &self.q_norm_gamma, self.n_heads, self.d_head, &self.runtime)?;
         let k = ops::qk_norm::qk_norm(&k, &self.k_norm_gamma, self.n_kv_heads, self.d_head, &self.runtime)?;
         if dbg {
-            // CPU QK-norm reference (last token only)
-            let qn_gpu = q.to_f32_vec();
-            let kn_gpu = k.to_f32_vec();
-            let q_gamma = self.q_norm_gamma.to_f32_vec();
-            let k_gamma = self.k_norm_gamma.to_f32_vec();
-            let hd = self.d_head;
+            let qn = q.to_f32_vec();
+            let kn = k.to_f32_vec();
             let last_q = (seq_len - 1) * self.q_dim;
             let last_k = (seq_len - 1) * self.kv_dim;
-            // CPU RMSNorm per-head for Q
-            let mut cpu_q = vec![0f32; self.q_dim];
-            for head in 0..self.n_heads {
-                let base = head * hd;
-                let mut sum_sq = 0.0f32;
-                for i in 0..hd { sum_sq += q_pre_norm[last_q + base + i] * q_pre_norm[last_q + base + i]; }
-                let rms = (sum_sq / hd as f32 + 1e-6f32).sqrt();
-                for i in 0..hd { cpu_q[base + i] = q_pre_norm[last_q + base + i] / rms * q_gamma[i]; }
-            }
-            let cpu_q_norm: f32 = cpu_q.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gpu_q_norm: f32 = qn_gpu[last_q..last_q+self.q_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
-            let max_q_diff: f32 = cpu_q.iter().zip(qn_gpu[last_q..last_q+self.q_dim].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] Q_qknorm: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_q_norm, gpu_q_norm, max_q_diff);
-            // CPU RMSNorm per-head for K
-            let mut cpu_k = vec![0f32; self.kv_dim];
-            for head in 0..self.n_kv_heads {
-                let base = head * hd;
-                let mut sum_sq = 0.0f32;
-                for i in 0..hd { sum_sq += k_pre_norm[last_k + base + i] * k_pre_norm[last_k + base + i]; }
-                let rms = (sum_sq / hd as f32 + 1e-6f32).sqrt();
-                for i in 0..hd { cpu_k[base + i] = k_pre_norm[last_k + base + i] / rms * k_gamma[i]; }
-            }
-            let cpu_k_norm: f32 = cpu_k.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gpu_k_norm: f32 = kn_gpu[last_k..last_k+self.kv_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
-            let max_k_diff: f32 = cpu_k.iter().zip(kn_gpu[last_k..last_k+self.kv_dim].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] K_qknorm: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_k_norm, gpu_k_norm, max_k_diff);
+            eprintln!("  [L0] Q_after_qknorm[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                qn[last_q], qn[last_q+1], qn[last_q+2], qn[last_q+3],
+                qn[last_q+4], qn[last_q+5], qn[last_q+6], qn[last_q+7]);
+            eprintln!("  [L0] K_after_qknorm[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                kn[last_k], kn[last_k+1], kn[last_k+2], kn[last_k+3],
+                kn[last_k+4], kn[last_k+5], kn[last_k+6], kn[last_k+7]);
         }
 
         // RoPE: reshape to [seq*n_heads, head_dim], apply per-head, reshape back
@@ -339,35 +312,16 @@ impl TransformerLayer {
         let q = q_2d.reshape(&[seq_len, self.q_dim]);
         let k = k_2d.reshape(&[seq_len, self.kv_dim]);
         if dbg {
-            // CPU RoPE reference for last token, first head
             let qd = q.to_f32_vec();
             let kd = k.to_f32_vec();
-            let hd = self.d_head;
             let last_q = (seq_len - 1) * self.q_dim;
-            let theta = self.rope_theta;
-            let pos_val = (pos + seq_len - 1) as f32;
-            let mut cpu_q_rope = vec![0.0f32; hd];
-            for i in 0..hd/2 {
-                let freq = pos_val / theta.powf(2.0 * i as f32 / hd as f32);
-                let cos_f = freq.cos();
-                let sin_f = freq.sin();
-                let x0 = q_pre_rope[last_q + i * 2];
-                let x1 = q_pre_rope[last_q + i * 2 + 1];
-                cpu_q_rope[i * 2] = x0 * cos_f - x1 * sin_f;
-                cpu_q_rope[i * 2 + 1] = x0 * sin_f + x1 * cos_f;
-            }
-            let cpu_q_rope_norm: f32 = cpu_q_rope.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gpu_q_rope_norm: f32 = qd[last_q..last_q+hd].iter().map(|x| x*x).sum::<f32>().sqrt();
-            let max_rope_diff: f32 = cpu_q_rope.iter().zip(qd[last_q..last_q+hd].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] Q_rope: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_q_rope_norm, gpu_q_rope_norm, max_rope_diff);
-            eprintln!("  [L{}] Q_rope[0..6]: CPU={:.4} {:.4} {:.4} {:.4} {:.4} {:.4}  GPU={:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
-                layer_idx,
-                cpu_q_rope[0], cpu_q_rope[1], cpu_q_rope[2], cpu_q_rope[3], cpu_q_rope[4], cpu_q_rope[5],
-                qd[last_q], qd[last_q+1], qd[last_q+2], qd[last_q+3], qd[last_q+4], qd[last_q+5]);
-            eprintln!("  [L{}] Q_pre_rope[0..6]: {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
-                layer_idx,
-                q_pre_rope[last_q], q_pre_rope[last_q+1], q_pre_rope[last_q+2],
-                q_pre_rope[last_q+3], q_pre_rope[last_q+4], q_pre_rope[last_q+5]);
+            let last_k = (seq_len - 1) * self.kv_dim;
+            eprintln!("  [L0] Q_after_rope[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                qd[last_q], qd[last_q+1], qd[last_q+2], qd[last_q+3],
+                qd[last_q+4], qd[last_q+5], qd[last_q+6], qd[last_q+7]);
+            eprintln!("  [L0] K_after_rope[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                kd[last_k], kd[last_k+1], kd[last_k+2], kd[last_k+3],
+                kd[last_k+4], kd[last_k+5], kd[last_k+6], kd[last_k+7]);
         }
 
         // Store K/V in cache
@@ -406,185 +360,75 @@ impl TransformerLayer {
         if dbg {
             let ao = attn_out.to_f32_vec();
             let last = (seq_len - 1) * self.q_dim;
-            let ao_last_norm: f32 = ao[last..last+self.q_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("  [L{}] attn_out: total={:.4} last_tok={:.4}", layer_idx, norm(&attn_out), ao_last_norm);
+            eprintln!("  [L0] attn_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                ao[last], ao[last+1], ao[last+2], ao[last+3],
+                ao[last+4], ao[last+5], ao[last+6], ao[last+7]);
         }
 
         // Output projection
         let proj_out = self.wo.forward(&attn_out)?;
         if dbg {
-            // CPU reference for proj_out (all tokens)
-            let ao = attn_out.to_f32_vec();
-            let wo_w = self.wo.weight.to_f32_vec();
-            let dim = self.dim;
-            let qd = self.q_dim;
-            let mut cpu_proj = vec![0f32; seq_len * dim];
-            for t in 0..seq_len {
-                for j in 0..dim {
-                    let mut sum = 0.0f32;
-                    for i in 0..qd {
-                        sum += ao[t * qd + i] * wo_w[i * dim + j];
-                    }
-                    cpu_proj[t * dim + j] = sum;
-                }
-            }
             let po = proj_out.to_f32_vec();
-            let max_diff: f32 = cpu_proj.iter().zip(po.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] proj_out: CPU={:.4} GPU={:.4} max_diff={:.6}",
-                layer_idx, cpu_proj.iter().map(|x| x*x).sum::<f32>().sqrt(), norm(&proj_out), max_diff);
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] proj_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                po[last], po[last+1], po[last+2], po[last+3],
+                po[last+4], po[last+5], po[last+6], po[last+7]);
         }
         let x2 = ops::add::add(x, &proj_out, device)?;
         if dbg {
             let d = x2.to_f32_vec();
-            let xd = x.to_f32_vec();
-            let pd = proj_out.to_f32_vec();
-            // CPU reference for x2 = x + proj_out
-            let mut cpu_x2 = vec![0f32; seq_len * self.dim];
-            for i in 0..seq_len * self.dim { cpu_x2[i] = xd[i] + pd[i]; }
-            let max_diff: f32 = cpu_x2.iter().zip(d.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] x2: CPU={:.4} GPU={:.4} max_diff={:.6}",
-                layer_idx, cpu_x2.iter().map(|x| x*x).sum::<f32>().sqrt(), norm(&x2), max_diff);
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] x2[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                d[last], d[last+1], d[last+2], d[last+3],
+                d[last+4], d[last+5], d[last+6], d[last+7]);
         }
 
         // === FFN sub-layer ===
         let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
+        if dbg {
+            let d = h2.to_f32_vec();
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] h2[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                d[last], d[last+1], d[last+2], d[last+3],
+                d[last+4], d[last+5], d[last+6], d[last+7]);
+        }
         let gate = self.w_gate.forward(&h2)?;
         let up = self.w_up.forward(&h2)?;
         if dbg {
-            // CPU RMSNorm reference for h2
-            let x2d = x2.to_f32_vec();
-            let gamma = self.ffn_norm_gamma.to_f32_vec();
-            let dim = self.dim;
-            let mut cpu_h2 = vec![0f32; seq_len * dim];
-            for t in 0..seq_len {
-                let mut sum_sq = 0.0f32;
-                for i in 0..dim {
-                    sum_sq += x2d[t * dim + i] * x2d[t * dim + i];
-                }
-                let rms = (sum_sq / dim as f32 + 1e-6f32).sqrt();
-                let inv_rms = 1.0 / rms;
-                for i in 0..dim {
-                    cpu_h2[t * dim + i] = x2d[t * dim + i] * inv_rms * gamma[i];
-                }
-            }
-            let cpu_h2_norm: f32 = cpu_h2.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gpu_h2_norm = norm(&h2);
-            let h2d = h2.to_f32_vec();
-            let max_h2_diff: f32 = cpu_h2.iter().zip(h2d.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            eprintln!("  [L{}] h2: CPU={:.4} GPU={:.4} max_diff={:.6}", layer_idx, cpu_h2_norm, gpu_h2_norm, max_h2_diff);
-            // CPU reference for gate (all tokens)
-            let h2d = h2.to_f32_vec();
-            let gw = self.w_gate.weight.to_f32_vec();
-            let ffn_dim = self.ffn_dim;
-            let dim = self.dim;
-            let mut cpu_gate_all = vec![0f32; seq_len * ffn_dim];
-            for t in 0..seq_len {
-                for j in 0..ffn_dim {
-                    let mut sum = 0.0f32;
-                    for i in 0..dim {
-                        sum += h2d[t * dim + i] * gw[i * ffn_dim + j];
-                    }
-                    cpu_gate_all[t * ffn_dim + j] = sum;
-                }
-            }
-            let cpu_gate_total: f32 = cpu_gate_all.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let cpu_gate_last: f32 = {
-                let s = (seq_len-1)*ffn_dim;
-                cpu_gate_all[s..s+ffn_dim].iter().map(|x| x*x).sum::<f32>().sqrt()
-            };
-            let gd = gate.to_f32_vec();
-            let gpu_gate_last: f32 = {
-                let s = (seq_len-1)*ffn_dim;
-                gd[s..s+ffn_dim].iter().map(|x| x*x).sum::<f32>().sqrt()
-            };
-            // CPU reference for up
-            let uw = self.w_up.weight.to_f32_vec();
-            let mut cpu_up_all = vec![0f32; seq_len * ffn_dim];
-            for t in 0..seq_len {
-                for j in 0..ffn_dim {
-                    let mut sum = 0.0f32;
-                    for i in 0..dim {
-                        sum += h2d[t * dim + i] * uw[i * ffn_dim + j];
-                    }
-                    cpu_up_all[t * ffn_dim + j] = sum;
-                }
-            }
-            let cpu_up_total: f32 = cpu_up_all.iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("  [L{}] gate: CPU={:.4} GPU={:.4}  up: CPU={:.4} GPU={:.4}",
-                layer_idx, cpu_gate_total, norm(&gate), cpu_up_total, norm(&up));
-            // Weight norms
-            let gw_norm: f32 = gw.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let uw_norm: f32 = uw.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let wd = self.w_down.weight.to_f32_vec();
-            let wd_norm: f32 = wd.iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("  [L{}] w_gate={:.4} w_up={:.4} w_down={:.4} h2={:.4}", layer_idx, gw_norm, uw_norm, wd_norm, norm(&h2));
-        }
-        let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-
-        if dbg {
-            // CPU SiLU reference
             let gd = gate.to_f32_vec();
             let ud = up.to_f32_vec();
-            let n_elems = gd.len();
-            let mut cpu_silu = vec![0f32; n_elems];
-            let mut cpu_silu_gate = vec![0f32; n_elems];
-            for i in 0..n_elems {
-                let sig = 1.0 / (1.0 + (-gd[i]).exp());
-                cpu_silu_gate[i] = gd[i] * sig;
-                cpu_silu[i] = gd[i] * sig * ud[i];
-            }
-            let cpu_silu_gate_norm: f32 = cpu_silu_gate.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let cpu_silu_norm: f32 = cpu_silu.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let last_g = (seq_len - 1) * self.ffn_dim;
+            eprintln!("  [L0] gate[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                gd[last_g], gd[last_g+1], gd[last_g+2], gd[last_g+3],
+                gd[last_g+4], gd[last_g+5], gd[last_g+6], gd[last_g+7]);
+            eprintln!("  [L0] up[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                ud[last_g], ud[last_g+1], ud[last_g+2], ud[last_g+3],
+                ud[last_g+4], ud[last_g+5], ud[last_g+6], ud[last_g+7]);
+        }
+        let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+        if dbg {
             let sd = silu_out.to_f32_vec();
             let last = (seq_len - 1) * self.ffn_dim;
-            let cpu_last_norm: f32 = cpu_silu[last..last+self.ffn_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
-            let gpu_last_norm: f32 = sd[last..last+self.ffn_dim].iter().map(|x| x*x).sum::<f32>().sqrt();
-            // Compare CPU silu with GPU silu
-            let sd = silu_out.to_f32_vec();
-            let max_diff: f32 = cpu_silu.iter().zip(sd.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            let mean_diff: f32 = cpu_silu.iter().zip(sd.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>() / n_elems as f32;
-            eprintln!("  [L{}] silu_gate={:.4} silu_out: CPU={:.4} GPU={:.4} max_diff={:.6} mean_diff={:.6}",
-                layer_idx, cpu_silu_gate_norm, cpu_silu_norm, norm(&silu_out), max_diff, mean_diff);
-            eprintln!("  [L{}] silu last first3: CPU={:.6} {:.6} {:.6}  GPU={:.6} {:.6} {:.6}",
-                layer_idx, cpu_silu[last], cpu_silu[last+1], cpu_silu[last+2],
-                sd[last], sd[last+1], sd[last+2]);
+            eprintln!("  [L0] silu[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                sd[last], sd[last+1], sd[last+2], sd[last+3],
+                sd[last+4], sd[last+5], sd[last+6], sd[last+7]);
         }
         let ffn_out = self.w_down.forward(&silu_out)?;
-
         if dbg {
-            // CPU reference for ffn_out (last token only)
-            let sd = silu_out.to_f32_vec();
-            let wd = self.w_down.weight.to_f32_vec();
-            let in_f = self.w_down.in_features;
-            let out_f = self.w_down.out_features;
-            let last_sd = (seq_len - 1) * in_f;
-            let mut cpu_ffn = vec![0f32; out_f];
-            for j in 0..out_f {
-                let mut sum = 0.0f32;
-                for i in 0..in_f {
-                    sum += sd[last_sd + i] * wd[i * out_f + j];
-                }
-                cpu_ffn[j] = sum;
-            }
-            let cpu_ffn_norm: f32 = cpu_ffn.iter().map(|x| x*x).sum::<f32>().sqrt();
             let fd = ffn_out.to_f32_vec();
-            let last_fd = (seq_len - 1) * out_f;
-            let gpu_ffn_norm: f32 = fd[last_fd..last_fd+out_f].iter().map(|x| x*x).sum::<f32>().sqrt();
-            eprintln!("  [L{}] ffn_out: CPU_last={:.4} GPU_last={:.4} total={:.4}",
-                layer_idx, cpu_ffn_norm, gpu_ffn_norm, norm(&ffn_out));
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] ffn_out[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                fd[last], fd[last+1], fd[last+2], fd[last+3],
+                fd[last+4], fd[last+5], fd[last+6], fd[last+7]);
         }
 
         let result = ops::add::add(&x2, &ffn_out, device)?;
         if dbg {
-            // CPU reference for x2 + ffn_out
-            let x2d = x2.to_f32_vec();
-            let fd = ffn_out.to_f32_vec();
             let rd = result.to_f32_vec();
-            let cpu_sum_norm: f32 = x2d.iter().zip(fd.iter()).map(|(a, b)| (a + b).powi(2)).sum::<f32>().sqrt();
-            let gpu_norm: f32 = rd.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let last_s = (seq_len - 1) * self.dim;
-            eprintln!("  [L{}] final: CPU_sum={:.4} GPU={:.4} x2[last][0]={:.4} ffn[last][0]={:.4} result[last][0]={:.4}",
-                layer_idx, cpu_sum_norm, gpu_norm, x2d[last_s], fd[last_s], rd[last_s]);
+            let last = (seq_len - 1) * self.dim;
+            eprintln!("  [L0] result[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                rd[last], rd[last+1], rd[last+2], rd[last+3],
+                rd[last+4], rd[last+5], rd[last+6], rd[last+7]);
         }
         Ok(result)
     }

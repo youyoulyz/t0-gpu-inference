@@ -112,6 +112,8 @@ impl LanguageModel {
     /// Call after loading weights if config.tie_word_embeddings is true.
     pub fn tie_lm_head(&mut self) {
         self.lm_head.weight = self.embedding.weight.clone();
+        self.lm_head.in_features = self.config.hidden_size;
+        self.lm_head.out_features = self.config.vocab_size;
     }
 
     /// Get all parameters for optimizer.
@@ -159,6 +161,16 @@ impl LanguageModel {
 
         // Embed all tokens at once via CPU (reads weight table once)
         let mut h = self.embedding.forward_cpu(ids)?;
+        {
+            let d = h.to_f32_vec();
+            let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let last_s = (seq_len - 1) * self.config.hidden_size;
+            let last_norm: f32 = d[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("[Prefill] EMB: total={:.4} last={:.4} first8=[{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}]",
+                n, last_norm,
+                d[last_s], d[last_s+1], d[last_s+2], d[last_s+3],
+                d[last_s+4], d[last_s+5], d[last_s+6], d[last_s+7]);
+        }
 
         // Run through all transformer layers with KV cache
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -170,10 +182,13 @@ impl LanguageModel {
             let d = h.to_f32_vec();
             let n: f32 = d.iter().map(|x| x * x).sum::<f32>().sqrt();
             let has_nan = d.iter().any(|x| x.is_nan());
-            if layer_idx <= 2 || layer_idx >= 26 {
-                eprintln!("[Prefill] layer_{}: in={:.4} out={:.4} ratio={:.4} nan={}",
-                    layer_idx, h_before, n, n / h_before, has_nan);
-            }
+            let last_s = (seq_len - 1) * self.config.hidden_size;
+            let last_norm: f32 = d[last_s..last_s+self.config.hidden_size].iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("[Prefill] L{}: in={:.4} out={:.4} last={:.4} first8=[{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}] nan={}",
+                layer_idx, h_before, n, last_norm,
+                d[last_s], d[last_s+1], d[last_s+2], d[last_s+3],
+                d[last_s+4], d[last_s+5], d[last_s+6], d[last_s+7],
+                has_nan);
         }
 
         // Advance KV cache position once after all layers have written
@@ -306,13 +321,13 @@ impl LanguageModel {
             current_token = ops::argmax::sample_token(&logits, temperature, top_p, &self.runtime)?;
             generated.push(current_token);
 
-            if next_token == eos_id {
+            if current_token == eos_id {
                 eprintln!("[Generate] EOS at step {}", step + 1);
                 break;
             }
 
             eprint!("[tok {}] {}ms id={} max_id={} max={:.2} mean={:.2}  ",
-                step + 1, decode_ms, next_token, max_idx, max_logit, mean_logit);
+                step + 1, decode_ms, current_token, max_idx, max_logit, mean_logit);
             if (step + 1) % 5 == 0 { eprintln!(); }
         }
         eprintln!("[Generate] Done. {} tokens generated.", generated.len());

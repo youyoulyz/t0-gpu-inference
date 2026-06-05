@@ -67,7 +67,7 @@ pub fn rope_forward(
         super::super::tensor::DType::F32, "rope_out"))
 }
 
-/// CPU reference implementation of RoPE forward (for testing).
+/// CPU reference implementation of RoPE forward (rotate_half style, for testing).
 pub fn cpu_rope_forward(x: &[f32], n_tokens: usize, dim: usize, base: f32, pos_offset: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n_tokens * dim];
     let half_d = dim / 2;
@@ -78,16 +78,16 @@ pub fn cpu_rope_forward(x: &[f32], n_tokens: usize, dim: usize, base: f32, pos_o
             let theta = pos * freq;
             let cos_t = theta.cos();
             let sin_t = theta.sin();
-            let even = t * dim + 2 * i;
-            let odd = even + 1;
-            out[even] = x[even] * cos_t - x[odd] * sin_t;
-            out[odd]  = x[even] * sin_t + x[odd] * cos_t;
+            let first = t * dim + i;
+            let second = first + half_d;
+            out[first]  = x[first] * cos_t - x[second] * sin_t;
+            out[second] = x[first] * sin_t + x[second] * cos_t;
         }
     }
     out
 }
 
-/// CPU reference: inverse RoPE (transpose rotation).
+/// CPU reference: inverse RoPE (transpose rotation, rotate_half style).
 pub fn cpu_rope_inverse(x: &[f32], n_tokens: usize, dim: usize, base: f32, pos_offset: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n_tokens * dim];
     let half_d = dim / 2;
@@ -98,11 +98,10 @@ pub fn cpu_rope_inverse(x: &[f32], n_tokens: usize, dim: usize, base: f32, pos_o
             let theta = pos * freq;
             let cos_t = theta.cos();
             let sin_t = theta.sin();
-            let even = t * dim + 2 * i;
-            let odd = even + 1;
-            // Inverse rotation: negate sin
-            out[even] = x[even] * cos_t + x[odd] * sin_t;
-            out[odd]  = -x[even] * sin_t + x[odd] * cos_t;
+            let first = t * dim + i;
+            let second = first + half_d;
+            out[first]  =  x[first] * cos_t + x[second] * sin_t;
+            out[second] = -x[first] * sin_t + x[second] * cos_t;
         }
     }
     out
@@ -168,10 +167,11 @@ mod tests {
         let x: Vec<f32> = (0..dim).map(|i| ((i as f32 * 0.31).cos() * 1.5)).collect();
         let out = cpu_rope_forward(&x, 1, dim, 10000.0, 7);
 
-        // Check each pair preserves x[2i]^2 + x[2i+1]^2
-        for i in 0..dim / 2 {
-            let in_norm = x[2 * i].powi(2) + x[2 * i + 1].powi(2);
-            let out_norm = out[2 * i].powi(2) + out[2 * i + 1].powi(2);
+        // Check each rotate_half pair preserves x[i]^2 + x[i+d/2]^2
+        let half_d = dim / 2;
+        for i in 0..half_d {
+            let in_norm = x[i].powi(2) + x[i + half_d].powi(2);
+            let out_norm = out[i].powi(2) + out[i + half_d].powi(2);
             assert!((in_norm - out_norm).abs() < 1e-5,
                 "pair {} norm: in={} out={}", i, in_norm, out_norm);
         }

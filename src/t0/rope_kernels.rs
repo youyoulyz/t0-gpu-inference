@@ -2,12 +2,13 @@
 //!
 //! # Algorithm
 //!
-//! RoPE applies position-dependent rotation to pairs of features (cos/sin rotation):
+//! RoPE applies position-dependent rotation using the "rotate_half" convention
+//! (matching HuggingFace / Qwen3):
 //! ```text
-//! For each pair (x[2i], x[2i+1]) at position pos:
-//!   θ = pos / 10000^(2i / d_model)
-//!   x'[2i]   = x[2i] * cos(θ) - x[2i+1] * sin(θ)
-//!   x'[2i+1] = x[2i] * sin(θ) + x[2i+1] * cos(θ)
+//! For each pair (x[i], x[i + d/2]) at position pos:
+//!   θ = pos / rope_theta^(2i / d_model)
+//!   x'[i]       = x[i] * cos(θ) - x[i + d/2] * sin(θ)
+//!   x'[i + d/2] = x[i] * sin(θ) + x[i + d/2] * cos(θ)
 //! ```
 //!
 //! # Design
@@ -25,8 +26,6 @@ const WG_SIZE: u32 = 128;
 
 /// Build RoPE forward kernel.
 ///
-/// Build RoPE forward kernel.
-///
 /// Kernarg layout: [x:u64, out:u64, d_model:u32, _reserved:u32, pos_base:u32, rope_theta:f32]
 ///
 /// The kernel applies RoPE to each row. Position = pos_base + pid >> n_heads_shift.
@@ -39,42 +38,32 @@ pub fn build_rope_forward(n_heads_shift: u32) -> BlockKernel {
     let x_ptr = kb.arg_ptr("x");
     let out_ptr = kb.arg_ptr("out");
     let d_model = kb.arg_u32("d_model");
-    let _reserved = kb.arg_u32("_reserved");  // was n_tokens, kept for kernarg layout compat
+    let _reserved = kb.arg_u32("_reserved");
     let pos_base = kb.arg_u32("pos_base");
     let rope_theta = kb.arg_f32("rope_theta");
 
-    let tid = kb.thread_id();     // pair index within row (0..d_model/2-1)
-    let pid = kb.program_id(0);   // row index
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
 
-    // Compute indices for the pair
-    // even_idx = 2 * tid, odd_idx = 2 * tid + 1
-    let two_u = kb.const_u32(2);
-    let even_idx = tid.mul(&mut kb, two_u);
-    let one = kb.const_u32(1);
-    let odd_idx = even_idx.add(&mut kb, one);
+    // rotate_half style: pair is (x[tid], x[tid + d_model/2])
+    let half_d = d_model.shr(&mut kb, 1);
 
-    // Mask: ensure odd_idx < d_model (both even and odd in bounds)
-    let pair_mask = odd_idx.lt(&mut kb, d_model);
+    // Mask: tid < d_model / 2
+    let pair_mask = tid.lt(&mut kb, half_d);
 
     // Row base offset
     let row_base = pid.mul(&mut kb, d_model);
-    let even_off = row_base.add(&mut kb, even_idx);
-    let odd_off = row_base.add(&mut kb, odd_idx);
 
-    // Load even and odd elements
-    let x_even = kb.load(x_ptr, even_off, pair_mask);
-    let x_odd = kb.load(x_ptr, odd_off, pair_mask);
+    // First half index and second half index
+    let first_off = row_base.add(&mut kb, tid);
+    let second_off = row_base.add(&mut kb, half_d).add(&mut kb, tid);
+
+    // Load first and second half elements
+    let x_first = kb.load(x_ptr, first_off, pair_mask);
+    let x_second = kb.load(x_ptr, second_off, pair_mask);
 
     // Compute frequency: θ = pos * (1 / rope_theta^(2i/d_model))
     // = pos * exp(-ln(rope_theta) * 2i/d_model)
-    //
-    // For numerical stability, compute log-domain:
-    // log(freq_i) = -(2*tid / d_model) * ln(rope_theta)
-    // freq_i = exp(log(freq_i))
-    //
-    // Then θ = pos * freq_i
-
-    // Step 1: ratio = 2*tid / d_model (float)
     let tid_f32 = tid.to_f32(&mut kb);
     let two_f = kb.const_f32(2.0);
     let two_tid_f = tid_f32.mul(&mut kb, two_f);
@@ -82,16 +71,12 @@ pub fn build_rope_forward(n_heads_shift: u32) -> BlockKernel {
     let inv_d_model = d_model_f.rcp(&mut kb);
     let ratio = two_tid_f.mul(&mut kb, inv_d_model);
 
-    // Step 2: -ratio * ln(rope_theta)
     let ln_theta = rope_theta.log(&mut kb);
     let neg_ln_theta = ln_theta.neg(&mut kb);
     let log_freq = ratio.mul(&mut kb, neg_ln_theta);
-
-    // Step 3: freq = exp(log_freq)
     let freq = log_freq.exp(&mut kb);
 
-    // Step 4: theta = (pos_base + token_idx) * freq
-    // token_idx = pid >> n_heads_shift (compile-time constant)
+    // Position = pos_base + (pid >> n_heads_shift)
     let token_idx = if n_heads_shift > 0 {
         pid.shr(&mut kb, n_heads_shift as u8)
     } else {
@@ -101,24 +86,22 @@ pub fn build_rope_forward(n_heads_shift: u32) -> BlockKernel {
     let pos_f = pos.to_f32(&mut kb);
     let theta = pos_f.mul(&mut kb, freq);
 
-    // Step 5: cos(θ) and sin(θ)
     let cos_theta = theta.cos(&mut kb);
     let sin_theta = theta.sin(&mut kb);
 
-    // Step 6: Apply rotation
-    // out_even = x_even * cos - x_odd * sin
-    // out_odd  = x_even * sin + x_odd * cos
-    let xc = x_even.mul(&mut kb, cos_theta);
-    let xs = x_odd.mul(&mut kb, sin_theta);
-    let out_even = xc.sub(&mut kb, xs);
+    // Apply rotation (rotate_half style):
+    // out[i]       = x[i] * cos - x[i+d/2] * sin
+    // out[i + d/2] = x[i] * sin + x[i+d/2] * cos
+    let xc = x_first.mul(&mut kb, cos_theta);
+    let xs = x_second.mul(&mut kb, sin_theta);
+    let out_first = xc.sub(&mut kb, xs);
 
-    let xe_sin = x_even.mul(&mut kb, sin_theta);
-    let xo_cos = x_odd.mul(&mut kb, cos_theta);
-    let out_odd = xe_sin.add(&mut kb, xo_cos);
+    let xe_sin = x_first.mul(&mut kb, sin_theta);
+    let xo_cos = x_second.mul(&mut kb, cos_theta);
+    let out_second = xe_sin.add(&mut kb, xo_cos);
 
-    // Store results
-    kb.store(out_ptr, even_off, out_even, pair_mask);
-    kb.store(out_ptr, odd_off, out_odd, pair_mask);
+    kb.store(out_ptr, first_off, out_first, pair_mask);
+    kb.store(out_ptr, second_off, out_second, pair_mask);
 
     kb
 }
@@ -127,8 +110,8 @@ pub fn build_rope_forward(n_heads_shift: u32) -> BlockKernel {
 ///
 /// The backward of RoPE is the inverse rotation (transpose of rotation matrix):
 /// ```text
-/// dx_even = dout_even * cos(θ) + dout_odd * sin(θ)
-/// dx_odd  = -dout_even * sin(θ) + dout_odd * cos(θ)
+/// dx[i]       = dout[i] * cos(θ) + dout[i + d/2] * sin(θ)
+/// dx[i + d/2] = -dout[i] * sin(θ) + dout[i + d/2] * cos(θ)
 /// ```
 ///
 /// Kernarg layout: [dout:u64, dx:u64, d_model:u32, n_tokens:u32, pos_base:u32, rope_theta:f32]
@@ -145,20 +128,16 @@ pub fn build_rope_backward() -> BlockKernel {
     let tid = kb.thread_id();
     let pid = kb.program_id(0);
 
-    let two_u = kb.const_u32(2);
-    let even_idx = tid.mul(&mut kb, two_u);
-    let one = kb.const_u32(1);
-    let odd_idx = even_idx.add(&mut kb, one);
-    let pair_mask = odd_idx.lt(&mut kb, d_model);
+    let half_d = d_model.shr(&mut kb, 1);
+    let pair_mask = tid.lt(&mut kb, half_d);
 
     let row_base = pid.mul(&mut kb, d_model);
-    let even_off = row_base.add(&mut kb, even_idx);
-    let odd_off = row_base.add(&mut kb, odd_idx);
+    let first_off = row_base.add(&mut kb, tid);
+    let second_off = row_base.add(&mut kb, half_d).add(&mut kb, tid);
 
-    let dout_even = kb.load(dout_ptr, even_off, pair_mask);
-    let dout_odd = kb.load(dout_ptr, odd_off, pair_mask);
+    let dout_first = kb.load(dout_ptr, first_off, pair_mask);
+    let dout_second = kb.load(dout_ptr, second_off, pair_mask);
 
-    // Same frequency computation as forward
     let tid_f32 = tid.to_f32(&mut kb);
     let two_f = kb.const_f32(2.0);
     let two_tid_f = tid_f32.mul(&mut kb, two_f);
@@ -175,24 +154,24 @@ pub fn build_rope_backward() -> BlockKernel {
     let cos_theta = theta.cos(&mut kb);
     let sin_theta = theta.sin(&mut kb);
 
-    // Inverse rotation (transpose)
-    // dx_even = dout_even * cos + dout_odd * sin
-    let dc = dout_even.mul(&mut kb, cos_theta);
-    let ds = dout_odd.mul(&mut kb, sin_theta);
-    let dx_even = dc.add(&mut kb, ds);
+    // Inverse rotation (rotate_half style):
+    // dx[i]       = dout[i] * cos + dout[i+d/2] * sin
+    // dx[i + d/2] = -dout[i] * sin + dout[i+d/2] * cos
+    let dc = dout_first.mul(&mut kb, cos_theta);
+    let ds = dout_second.mul(&mut kb, sin_theta);
+    let dx_first = dc.add(&mut kb, ds);
 
-    // dx_odd = -dout_even * sin + dout_odd * cos
-    let neg_de_sin = dout_even.mul(&mut kb, sin_theta).neg(&mut kb);
-    let do_cos = dout_odd.mul(&mut kb, cos_theta);
-    let dx_odd = neg_de_sin.add(&mut kb, do_cos);
+    let neg_de_sin = dout_first.mul(&mut kb, sin_theta).neg(&mut kb);
+    let do_cos = dout_second.mul(&mut kb, cos_theta);
+    let dx_second = neg_de_sin.add(&mut kb, do_cos);
 
-    kb.store(dx_ptr, even_off, dx_even, pair_mask);
-    kb.store(dx_ptr, odd_off, dx_odd, pair_mask);
+    kb.store(dx_ptr, first_off, dx_first, pair_mask);
+    kb.store(dx_ptr, second_off, dx_second, pair_mask);
 
     kb
 }
 
-/// CPU reference: RoPE forward
+/// CPU reference: RoPE forward (rotate_half style)
 pub fn cpu_rope_forward(x: &[f32], out: &mut [f32], n_tokens: usize, d_model: usize, base: f32) {
     let half_d = d_model / 2;
     for t in 0..n_tokens {
@@ -202,15 +181,15 @@ pub fn cpu_rope_forward(x: &[f32], out: &mut [f32], n_tokens: usize, d_model: us
             let cos_t = theta.cos();
             let sin_t = theta.sin();
 
-            let even = t * d_model + 2 * i;
-            let odd = even + 1;
-            out[even] = x[even] * cos_t - x[odd] * sin_t;
-            out[odd]  = x[even] * sin_t + x[odd] * cos_t;
+            let first = t * d_model + i;
+            let second = first + half_d;
+            out[first]  = x[first] * cos_t - x[second] * sin_t;
+            out[second] = x[first] * sin_t + x[second] * cos_t;
         }
     }
 }
 
-/// CPU reference: RoPE backward
+/// CPU reference: RoPE backward (rotate_half style)
 pub fn cpu_rope_backward(dout: &[f32], dx: &mut [f32], n_tokens: usize, d_model: usize, base: f32) {
     let half_d = d_model / 2;
     for t in 0..n_tokens {
@@ -220,10 +199,10 @@ pub fn cpu_rope_backward(dout: &[f32], dx: &mut [f32], n_tokens: usize, d_model:
             let cos_t = theta.cos();
             let sin_t = theta.sin();
 
-            let even = t * d_model + 2 * i;
-            let odd = even + 1;
-            dx[even] =  dout[even] * cos_t + dout[odd] * sin_t;
-            dx[odd]  = -dout[even] * sin_t + dout[odd] * cos_t;
+            let first = t * d_model + i;
+            let second = first + half_d;
+            dx[first]  =  dout[first] * cos_t + dout[second] * sin_t;
+            dx[second] = -dout[first] * sin_t + dout[second] * cos_t;
         }
     }
 }
