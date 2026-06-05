@@ -56,6 +56,7 @@ pub struct TransformerLayer {
     pub kv_dim: usize,
     pub ffn_dim: usize,
     pub rope_theta: f32,
+    wqkv_bf16: std::sync::OnceLock<Option<crate::kfd::GpuBuffer>>,
     runtime: Arc<GpuRuntime>,
 }
 
@@ -120,6 +121,7 @@ impl TransformerLayer {
             kv_dim,
             ffn_dim,
             rope_theta: config.rope_theta,
+            wqkv_bf16: std::sync::OnceLock::new(),
             runtime: runtime.clone(),
         })
     }
@@ -176,6 +178,7 @@ impl TransformerLayer {
             kv_dim: dim,
             ffn_dim,
             rope_theta: 10000.0,
+            wqkv_bf16: std::sync::OnceLock::new(),
             runtime: runtime.clone(),
         })
     }
@@ -226,6 +229,10 @@ impl TransformerLayer {
         ops::add::add(&x2, &ffn_out, device)
     }
 
+    pub fn set_wqkv_bf16(&self, buf: crate::kfd::GpuBuffer) {
+        let _ = self.wqkv_bf16.set(Some(buf));
+    }
+
     /// Inference forward pass with RoPE, QK-norm, standard attention, and KV cache.
     ///
     /// # Arguments
@@ -250,10 +257,29 @@ impl TransformerLayer {
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
 
-        // Q/K/V projections
-        let q = self.wq.forward(&h)?;
-        let k = self.wk.forward(&h)?;
-        let v = self.wv.forward(&h)?;
+        // Q/K/V projections — fused for decode (1 GEMM vs 3), separate for prefill
+        let (q, k, v, _qkv_holder) = if seq_len == 1 {
+            if let Some(Some(wt)) = self.wqkv_bf16.get() {
+                let n_fused = self.q_dim + 2 * self.kv_dim;
+                let qkv = ops::bf16_matmul::matmul_with_wt_bf16(
+                    &h, wt, 1, self.dim, n_fused, &self.runtime,
+                )?;
+                let base = qkv.gpu_addr();
+                let q = Tensor::from_gpu_addr(base, &self.runtime, &[1, self.q_dim], "q_fused");
+                let k = Tensor::from_gpu_addr(
+                    base + (self.q_dim * 4) as u64, &self.runtime, &[1, self.kv_dim], "k_fused",
+                );
+                let v = Tensor::from_gpu_addr(
+                    base + ((self.q_dim + self.kv_dim) * 4) as u64,
+                    &self.runtime, &[1, self.kv_dim], "v_fused",
+                );
+                (q, k, v, Some(qkv))
+            } else {
+                (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None)
+            }
+        } else {
+            (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None)
+        };
 
         if dbg && layer_idx == 0 {
             let hd = h.to_f32_vec();

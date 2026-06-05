@@ -500,6 +500,47 @@ pub fn load_qwen3_into_model(
             layer.k_norm_gamma = bf16_to_f32_tensor(w, runtime);
         }
 
+        // Fused QKV: concatenate q/k/v bf16 weights [N,K] → [N_fused,K] and pad for GEMM
+        {
+            let q_key = format!("{}.self_attn.q_proj.weight", prefix);
+            let k_key = format!("{}.self_attn.k_proj.weight", prefix);
+            let v_key = format!("{}.self_attn.v_proj.weight", prefix);
+            if let (Some(q_t), Some(k_t), Some(v_t)) =
+                (all_tensors.get(&q_key), all_tensors.get(&k_key), all_tensors.get(&v_key))
+            {
+                let q_shape = q_t.shape();
+                let k_shape = k_t.shape();
+                let q_n = q_shape[0];
+                let kv_n = k_shape[0];
+                let k_dim = q_shape[1];
+                let n_fused = q_n + 2 * kv_n;
+
+                let _ = runtime.wait_idle();
+                let row_bytes = k_dim * 2;
+
+                let mut q_raw = vec![0u8; q_n * row_bytes];
+                let mut k_raw = vec![0u8; kv_n * row_bytes];
+                let mut v_raw = vec![0u8; kv_n * row_bytes];
+                q_t.buffer().read(&mut q_raw);
+                k_t.buffer().read(&mut k_raw);
+                v_t.buffer().read(&mut v_raw);
+
+                let mut fused_raw = vec![0u8; n_fused * row_bytes];
+                fused_raw[..q_n * row_bytes].copy_from_slice(&q_raw);
+                fused_raw[q_n * row_bytes..(q_n + kv_n) * row_bytes].copy_from_slice(&k_raw);
+                fused_raw[(q_n + kv_n) * row_bytes..].copy_from_slice(&v_raw);
+
+                let fused_buf = runtime.device.alloc_vram(fused_raw.len())?;
+                fused_buf.write_bytes(0, &fused_raw);
+
+                let wt_bf16 = crate::ignis::ops::bf16_matmul::precompute_wt_bf16_from_raw(
+                    runtime, &fused_buf, n_fused, k_dim,
+                )?;
+                layer.set_wqkv_bf16(wt_bf16);
+                eprintln!("[Safetensors] L{}: fused QKV bf16 [{}] → [{}]", layer_idx, n_fused, k_dim);
+            }
+        }
+
         eprintln!("[Safetensors] Assigned layer {}", layer_idx);
     }
 
