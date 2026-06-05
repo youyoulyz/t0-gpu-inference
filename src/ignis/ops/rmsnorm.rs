@@ -17,6 +17,305 @@ use super::super::tape::Tape;
 
 const DEFAULT_EPSILON: f32 = 1e-6;
 
+/// Fused RMSNorm + Residual Add: out = x + rmsnorm(x, gamma)
+///
+/// - x: [rows, dim] f32
+/// - gamma: [dim] f32 (per-channel scale)
+/// - eps: epsilon for numerical stability (default 1e-6 for Qwen3)
+///
+/// This is the most common pattern in transformer inference:
+///   x2 = x + attn_norm(x)   (attention sub-layer)
+///   x3 = x2 + ffn_norm(x2)  (FFN sub-layer)
+/// Fusing saves one dispatch (add kernel) and one global store/load.
+#[cfg(feature = "rocm")]
+pub fn rmsnorm_residual_add(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+    rmsnorm_residual_add_eps(x, gamma, _device, DEFAULT_EPSILON)
+}
+
+/// Fused RMSNorm + Residual Add with explicit epsilon.
+#[cfg(feature = "rocm")]
+pub fn rmsnorm_residual_add_eps(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>, eps: f32) -> Result<Tensor, String> {
+    crate::profile_scope!("rmsnorm_residual_add");
+    let runtime = x.runtime().clone();
+    let shape = x.shape().to_vec();
+    assert!(shape.len() >= 1, "rmsnorm_residual_add: need at least 1D");
+    let dim = *shape.last().unwrap();
+    let rows = x.numel() / dim;
+    assert_eq!(gamma.numel(), dim, "rmsnorm_residual_add: gamma dim mismatch");
+
+    let gamma_f32 = if gamma.dtype() == super::super::tensor::DType::BF16 {
+        let data = gamma.to_f32_vec();
+        let buf = runtime.upload_f32(&data)?;
+        super::super::tensor::Tensor::from_buffer(
+            std::sync::Arc::new(buf), &runtime, gamma.shape(),
+            super::super::tensor::DType::F32, "gamma_f32"
+        )
+    } else {
+        gamma.clone()
+    };
+
+    let wg_size: u32 = 32;
+    let out_buf = runtime.alloc_f32(rows * dim)?;
+    let rms_buf = runtime.alloc_f32(rows)?;
+
+    let kernel = {
+        let eps_bits = eps.to_bits();
+        let name = format!("bdsl_rmsnorm_resadd_d{}_wg{}_e{}", dim, wg_size, eps_bits);
+        let cached = runtime.get_kernel(&name);
+        if let Some(k) = cached {
+            k
+        } else {
+            use crate::t0::block_dsl::BlockKernel;
+            use crate::t0::ir::Target;
+            let mut kb = BlockKernel::new(&name, wg_size);
+            let x_ptr = kb.arg_ptr("x");
+            let gamma_ptr = kb.arg_ptr("gamma");
+            let out_ptr = kb.arg_ptr("out");
+            let rms_ptr = kb.arg_ptr("rms");
+            let dim_arg = kb.arg_u32("dim");
+
+            let row_id = kb.program_id(0);
+            let lane_id = kb.thread_id();
+            let row_base = row_id.mul(&mut kb, dim_arg);
+            let zero = kb.const_u32(0);
+            let zero_f = kb.const_f32(0.0);
+
+            let lds = kb.lds_alloc(wg_size * 4);
+            kb.lds_store(lds, lane_id, zero_f);
+            kb.barrier();
+
+            let iter1 = kb.for_range(zero, dim_arg, wg_size);
+            {
+                let col = iter1.add(&mut kb, lane_id);
+                let mask = col.lt(&mut kb, dim_arg);
+                let idx = row_base.add(&mut kb, col);
+                let val = kb.load(x_ptr, idx, mask);
+                let sq = val.mul(&mut kb, val);
+                let cur = kb.lds_load(lds, lane_id);
+                let new_val = cur.add(&mut kb, sq);
+                kb.lds_store(lds, lane_id, new_val);
+            }
+            kb.end_for(iter1);
+            kb.barrier();
+
+            let sum_sq = kb.lds_load(lds, lane_id);
+            let sum_sq = kb.wave_reduce_sum_val(sum_sq);
+
+            let dim_f = dim_arg.to_f32(&mut kb);
+            let inv_dim = dim_f.rcp(&mut kb);
+            let mean_sq = sum_sq.mul(&mut kb, inv_dim);
+            let eps_val = kb.const_f32(eps);
+            let rms = mean_sq.add(&mut kb, eps_val).sqrt(&mut kb);
+            let inv_rms = rms.rcp(&mut kb);
+
+            let one_u = kb.const_u32(1);
+            let lane_mask = lane_id.lt(&mut kb, one_u);
+            kb.store(rms_ptr, row_id, inv_rms, lane_mask);
+
+            let iter2 = kb.for_range(zero, dim_arg, wg_size);
+            {
+                let col = iter2.add(&mut kb, lane_id);
+                let mask = col.lt(&mut kb, dim_arg);
+                let idx = row_base.add(&mut kb, col);
+                let val = kb.load(x_ptr, idx, mask);
+                let g = kb.load(gamma_ptr, col, mask);
+                let normed = val.mul(&mut kb, inv_rms).mul(&mut kb, g);
+                let y = val.add(&mut kb, normed);
+                kb.store(out_ptr, idx, y, mask);
+            }
+            kb.end_for(iter2);
+
+            let compiled = kb.compile(Target::GFX1100)?;
+            runtime.compile_dsl(compiled)?
+        }
+    };
+
+    let ka = crate::kernargs![
+        x.gpu_addr() => u64,
+        gamma_f32.gpu_addr() => u64,
+        out_buf.gpu_addr() => u64,
+        rms_buf.gpu_addr() => u64,
+        dim as u32 => u32
+    ];
+    runtime.dispatch(&kernel, [rows as u32 * wg_size, 1, 1], &ka)?;
+
+    let out_arc = Arc::new(out_buf);
+    let output = Tensor::from_buffer(out_arc, &runtime, &shape, super::super::tensor::DType::F32, "rmsnorm_resadd_out");
+
+    if Tape::is_recording() && (x.requires_grad() || gamma.requires_grad()) {
+        let x_id = Some(x.id());
+        let g_id = Some(gamma.id());
+        let x_needs = x.requires_grad();
+        let g_needs = gamma.requires_grad();
+        let x_buf = x.buffer_arc().clone();
+        let g_buf = gamma.buffer_arc().clone();
+        let d = dim;
+        let r = rows;
+        let rms_arc = Arc::new(rms_buf);
+
+        let node_id = Tape::record(
+            "rmsnorm_residual_add",
+            output.id(),
+            vec![x_id, g_id],
+            vec![x_needs, g_needs],
+            vec![x_buf, g_buf, rms_arc],
+            Box::new(move |grad_output, saved, runtime| {
+                let mut grads = Vec::new();
+
+                if x_needs {
+                    let dx_kernel = {
+                        let bwd_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                        let bwd_epl = ((d as u32 + bwd_wg - 1) / bwd_wg) as u32;
+                        let name = format!("bdsl_rmsnorm_resadd_dx_d{}_wg{}", d, bwd_wg);
+                        let cached = runtime.get_kernel(&name);
+                        if let Some(k) = cached {
+                            k
+                        } else {
+                            use crate::t0::block_dsl::BlockKernel;
+                            use crate::t0::ir::Target;
+                            let mut kb = BlockKernel::new(&name, bwd_wg);
+                            let dy_ptr = kb.arg_ptr("dy");
+                            let x_ptr = kb.arg_ptr("x");
+                            let gamma_ptr = kb.arg_ptr("gamma");
+                            let irms_ptr = kb.arg_ptr("inv_rms");
+                            let dx_ptr = kb.arg_ptr("dx");
+                            let dim_arg = kb.arg_u32("dim");
+
+                            let row_id = kb.program_id(0);
+                            let lane_id = kb.thread_id();
+                            let row_base = row_id.mul(&mut kb, dim_arg);
+
+                            let max_u = kb.const_u32(u32::MAX);
+                            let always = row_id.lt(&mut kb, max_u);
+                            let inv_rms = kb.load(irms_ptr, row_id, always);
+                            let inv_rms3 = inv_rms.mul(&mut kb, inv_rms).mul(&mut kb, inv_rms);
+
+                            let mut dot = kb.const_f32(0.0);
+                            for j in 0..bwd_epl {
+                                let col = if j == 0 { lane_id } else {
+                                    let o = kb.const_u32(j * bwd_wg);
+                                    lane_id.add(&mut kb, o)
+                                };
+                                let mask = col.lt(&mut kb, dim_arg);
+                                let idx = row_base.add(&mut kb, col);
+                                let dy = kb.load(dy_ptr, idx, mask);
+                                let x = kb.load(x_ptr, idx, mask);
+                                let g = kb.load(gamma_ptr, col, mask);
+                                let term = dy.mul(&mut kb, g).mul(&mut kb, x);
+                                dot = dot.add(&mut kb, term);
+                            }
+                            dot = kb.wave_reduce_sum_val(dot);
+
+                            let dim_f = dim_arg.to_f32(&mut kb);
+                            let inv_dim = dim_f.rcp(&mut kb);
+                            let scale2 = dot.mul(&mut kb, inv_rms3).mul(&mut kb, inv_dim);
+                            for j in 0..bwd_epl {
+                                let col = if j == 0 { lane_id } else {
+                                    let o = kb.const_u32(j * bwd_wg);
+                                    lane_id.add(&mut kb, o)
+                                };
+                                let mask = col.lt(&mut kb, dim_arg);
+                                let idx = row_base.add(&mut kb, col);
+                                let dy = kb.load(dy_ptr, idx, mask);
+                                let x = kb.load(x_ptr, idx, mask);
+                                let g = kb.load(gamma_ptr, col, mask);
+                                let term1 = dy.mul(&mut kb, g).mul(&mut kb, inv_rms);
+                                let term2 = x.mul(&mut kb, scale2);
+                                let normed_grad = term1.sub(&mut kb, term2);
+                                let result = dy.add(&mut kb, normed_grad);
+                                kb.store(dx_ptr, idx, result, mask);
+                            }
+
+                            let compiled = kb.compile(Target::GFX1100)?;
+                            runtime.compile_dsl(compiled)?
+                        }
+                    };
+
+                    let dx_buf = runtime.alloc_f32(r * d)?;
+                    let bwd_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                    let ka = crate::kernargs![
+                        grad_output.gpu_addr() => u64,
+                        saved[0].gpu_addr() => u64,
+                        saved[1].gpu_addr() => u64,
+                        saved[2].gpu_addr() => u64,
+                        dx_buf.gpu_addr() => u64,
+                        d as u32 => u32
+                    ];
+                    runtime.dispatch(&dx_kernel, [r as u32 * bwd_wg, 1, 1], &ka)?;
+                    grads.push(Some(Arc::new(dx_buf)));
+                } else {
+                    grads.push(None);
+                }
+
+                if g_needs {
+                    let dg_kernel = {
+                        let dg_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                        let dg_epl = ((d as u32 + dg_wg - 1) / dg_wg) as u32;
+                        let name = format!("bdsl_rmsnorm_resadd_dg_d{}_wg{}", d, dg_wg);
+                        let cached = runtime.get_kernel(&name);
+                        if let Some(k) = cached {
+                            k
+                        } else {
+                            use crate::t0::block_dsl::BlockKernel;
+                            use crate::t0::ir::Target;
+                            let mut kb = BlockKernel::new(&name, dg_wg);
+                            let dy_ptr = kb.arg_ptr("dy");
+                            let x_ptr = kb.arg_ptr("x");
+                            let irms_ptr = kb.arg_ptr("inv_rms");
+                            let dg_ptr = kb.arg_ptr("dgamma");
+                            let dim_arg = kb.arg_u32("dim");
+
+                            let row_id = kb.program_id(0);
+                            let lane_id = kb.thread_id();
+                            let row_base = row_id.mul(&mut kb, dim_arg);
+
+                            let max_u = kb.const_u32(u32::MAX);
+                            let always = row_id.lt(&mut kb, max_u);
+                            let inv_rms = kb.load(irms_ptr, row_id, always);
+
+                            for j in 0..dg_epl {
+                                let col = if j == 0 { lane_id } else {
+                                    let o = kb.const_u32(j * dg_wg);
+                                    lane_id.add(&mut kb, o)
+                                };
+                                let mask = col.lt(&mut kb, dim_arg);
+                                let idx = row_base.add(&mut kb, col);
+                                let dy = kb.load(dy_ptr, idx, mask);
+                                let x = kb.load(x_ptr, idx, mask);
+                                let contrib = dy.mul(&mut kb, x).mul(&mut kb, inv_rms);
+                                kb.atomic_add_f32(dg_ptr, col, contrib, mask);
+                            }
+
+                            let compiled = kb.compile(Target::GFX1100)?;
+                            runtime.compile_dsl(compiled)?
+                        }
+                    };
+
+                    let dg_buf = runtime.alloc_f32(d)?;
+                    dg_buf.zero();
+                    let dg_wg: u32 = (d as u32).next_power_of_two().min(256).max(32);
+                    let ka = crate::kernargs![
+                        grad_output.gpu_addr() => u64,
+                        saved[0].gpu_addr() => u64,
+                        saved[2].gpu_addr() => u64,
+                        dg_buf.gpu_addr() => u64,
+                        d as u32 => u32
+                    ];
+                    runtime.dispatch(&dg_kernel, [r as u32 * dg_wg, 1, 1], &ka)?;
+                    grads.push(Some(Arc::new(dg_buf)));
+                } else {
+                    grads.push(None);
+                }
+
+                Ok(grads)
+            }),
+        );
+        output.set_tape_node(node_id);
+    }
+
+    Ok(output)
+}
+
 /// RMSNorm forward: y = (x / rms(x)) * gamma
 ///
 /// - x: [rows, dim] f32

@@ -201,12 +201,8 @@ impl LanguageModel {
         }
 
         let hidden = self.config.hidden_size;
-        let last_hidden_data = {
-            let full = h.to_f32_vec();
-            let start = (seq_len - 1) * hidden;
-            full[start..start + hidden].to_vec()
-        };
-        let last_hidden = Tensor::from_f32(&self.runtime, &last_hidden_data, &[1, hidden], "last_hidden")?;
+        let last_addr = h.gpu_addr() + ((seq_len - 1) * hidden * 4) as u64;
+        let last_hidden = Tensor::from_gpu_addr(last_addr, &self.runtime, &[1, hidden], "last_hidden");
 
         let logits = self.lm_head.forward(&last_hidden)?;
 

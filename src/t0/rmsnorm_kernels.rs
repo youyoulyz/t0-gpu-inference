@@ -193,6 +193,83 @@ pub fn cpu_rmsnorm_backward(
 pub fn rmsnorm_grid(rows: u32) -> (u32, u32) { (rows * WG_SIZE, 1) }
 pub fn rmsnorm_wg_size() -> u32 { WG_SIZE }
 
+/// Build fused RMSNorm + Residual Add kernel.
+///
+/// Computes: out = x + rmsnorm(x, weight)
+///
+/// Kernarg layout: [input:u64, weight:u64, output:u64, rms:u64, cols:u32, eps:f32]
+/// Grid: (rows * WG_SIZE, 1, 1) — one WG per row
+pub fn build_rmsnorm_residual_add() -> BlockKernel {
+    let mut kb = BlockKernel::new("rmsnorm_resadd", WG_SIZE);
+
+    let input_ptr = kb.arg_ptr("input");
+    let weight_ptr = kb.arg_ptr("weight");
+    let output_ptr = kb.arg_ptr("output");
+    let rms_ptr = kb.arg_ptr("rms");
+    let cols = kb.arg_u32("cols");
+    let eps = kb.arg_f32("eps");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+
+    let row_base = pid.mul(&mut kb, cols);
+    let zero_f = kb.const_f32(0.0);
+    let zero = kb.const_u32(0);
+
+    let (iter1, sum_sq) = kb.for_range_acc(zero, cols, WG_SIZE, zero_f);
+    {
+        let col = iter1.add(&mut kb, tid);
+        let in_bounds = col.lt(&mut kb, cols);
+        let offset = row_base.add(&mut kb, col);
+        let x = kb.load(input_ptr, offset, in_bounds);
+        let x_sq = x.mul(&mut kb, x);
+        let x_sq_masked = in_bounds.select(&mut kb, x_sq, zero_f);
+        let new_acc = sum_sq.add(&mut kb, x_sq_masked);
+        let _ = kb.end_for_acc(iter1, new_acc);
+    }
+
+    let sum_sq = kb.wg_reduce_sum(sum_sq);
+    let cols_f = cols.to_f32(&mut kb);
+    let mean_sq = sum_sq.div(&mut kb, cols_f);
+    let mean_sq_eps = mean_sq.add(&mut kb, eps);
+    let rstd = mean_sq_eps.rsqrt(&mut kb);
+
+    let one_u = kb.const_u32(1);
+    let lane_mask = tid.lt(&mut kb, one_u);
+    kb.store(rms_ptr, pid, rstd, lane_mask);
+
+    let iter2 = kb.for_range(zero, cols, WG_SIZE);
+    {
+        let col = iter2.add(&mut kb, tid);
+        let in_bounds = col.lt(&mut kb, cols);
+        let offset = row_base.add(&mut kb, col);
+        let x = kb.load(input_ptr, offset, in_bounds);
+        let w = kb.load(weight_ptr, col, in_bounds);
+        let normed = x.mul(&mut kb, rstd).mul(&mut kb, w);
+        let y = x.add(&mut kb, normed);
+        kb.store(output_ptr, offset, y, in_bounds);
+    }
+    kb.end_for(iter2);
+
+    kb
+}
+
+/// CPU reference: fused RMSNorm + Residual Add
+pub fn cpu_rmsnorm_residual_add(
+    input: &[f32], weight: &[f32], output: &mut [f32],
+    rows: usize, cols: usize, eps: f32,
+) {
+    for r in 0..rows {
+        let row = &input[r * cols..(r + 1) * cols];
+        let out = &mut output[r * cols..(r + 1) * cols];
+        let mean_sq: f32 = row.iter().map(|&x| x * x).sum::<f32>() / cols as f32;
+        let rstd = 1.0 / (mean_sq + eps).sqrt();
+        for c in 0..cols {
+            out[c] = row[c] + row[c] * rstd * weight[c];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +317,29 @@ mod tests {
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RMSNorm backward: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
+    }
+
+    #[test]
+    fn test_rmsnorm_resadd_compiles() {
+        let kb = build_rmsnorm_residual_add();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("rmsnorm resadd compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ RMSNorm+ResAdd: {} bytes ELF, wg={:?}, lds={}",
+            ck.elf.len(), ck.workgroup_size, ck.lds_size);
+    }
+
+    #[test]
+    fn test_cpu_rmsnorm_residual_add() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let weight = vec![1.0, 1.0, 1.0, 1.0];
+        let mut output = vec![0.0; 4];
+        cpu_rmsnorm_residual_add(&input, &weight, &mut output, 1, 4, 1e-5);
+        let rms = (7.5f32 + 1e-5).sqrt();
+        for c in 0..4 {
+            let expected = input[c] + input[c] / rms;
+            assert!((output[c] - expected).abs() < 1e-5,
+                "rmsnorm_resadd[{}]: got={} expected={}", c, output[c], expected);
+        }
     }
 
     #[cfg(feature = "rocm")]

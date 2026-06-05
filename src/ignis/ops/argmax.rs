@@ -85,16 +85,9 @@ pub fn sample_categorical(
 
 /// Sample a single token from logits with temperature and top-p filtering.
 ///
-/// This runs on CPU (reads logits from GPU, samples, returns token ID).
-/// Suitable for single-token decode; for batch decode, consider GPU sampling.
-///
-/// # Arguments
-/// - `logits`: [vocab_size] f32 tensor (raw logits for one position)
-/// - `temperature`: sampling temperature. <= 0 means greedy argmax.
-/// - `top_p`: nucleus sampling threshold (0.0 = greedy, 1.0 = no filtering)
-///
-/// # Returns
-/// - sampled token ID as u32
+/// For greedy mode (temperature ≤ 0 or top_p ≤ 0), uses GPU argmax kernel
+/// to avoid downloading the full logits vector (595KB for Qwen3).
+/// For sampling modes, falls back to CPU with full logits download.
 #[cfg(feature = "rocm")]
 pub fn sample_token(
     logits: &Tensor,
@@ -103,26 +96,18 @@ pub fn sample_token(
     runtime: &Arc<GpuRuntime>,
 ) -> Result<u32, String> {
     let vocab_size = logits.numel();
-    let data = runtime.read_f32(logits.buffer(), vocab_size);
 
-    // Greedy: just argmax
+    // Greedy: GPU argmax (single dispatch, ~5KB readback vs 607KB full download)
     if temperature <= 0.0 || top_p <= 0.0 {
-        let mut best_idx = 0usize;
-        let mut best_val = data[0];
-        for i in 1..vocab_size {
-            if data[i] > best_val {
-                best_val = data[i];
-                best_idx = i;
-            }
-        }
-        return Ok(best_idx as u32);
+        return gpu_argmax(logits, runtime);
     }
 
-    // Apply temperature
+    // Sampling: CPU fallback (requires full logits download)
+    let data = runtime.read_f32(logits.buffer(), vocab_size);
+
     let inv_temp = 1.0 / temperature;
     let mut scaled: Vec<f32> = data.iter().map(|&l| l * inv_temp).collect();
 
-    // Softmax (numerically stable)
     let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     for v in scaled.iter_mut() {
         *v = (*v - max_val).exp();
@@ -132,13 +117,10 @@ pub fn sample_token(
         *v /= sum;
     }
 
-    // Top-p (nucleus) filtering
     if top_p < 1.0 {
-        // Sort by probability descending
         let mut indexed: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &p)| (i, p)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Find cutoff
         let mut cumsum = 0.0f32;
         let mut cutoff_idx = indexed.len();
         for (i, (_, p)) in indexed.iter().enumerate() {
@@ -149,7 +131,6 @@ pub fn sample_token(
             }
         }
 
-        // Zero out tokens beyond cutoff and renormalize
         let mut keep = vec![false; vocab_size];
         for &(idx, _) in &indexed[..cutoff_idx] {
             keep[idx] = true;
@@ -168,8 +149,6 @@ pub fn sample_token(
         }
     }
 
-    // Sample from the distribution using simple random sampling
-    // Use a simple LCG PRNG seeded from current time
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -184,8 +163,49 @@ pub fn sample_token(
         }
     }
 
-    // Fallback: return last non-zero token
     Ok((vocab_size - 1) as u32)
+}
+
+/// GPU argmax: find the index of the maximum value in a 1D tensor.
+///
+/// Uses a single-dispatch chunked reduce kernel. Each workgroup processes
+/// 256 elements and writes (max_val, global_idx) to partial buffers.
+/// CPU then reduces the partial results (a few KB vs 607KB full download).
+#[cfg(feature = "rocm")]
+fn gpu_argmax(logits: &Tensor, runtime: &Arc<GpuRuntime>) -> Result<u32, String> {
+    let vocab_size = logits.numel();
+    let chunk_size = 256usize;
+    let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
+
+    let vals_buf = runtime.device.alloc_vram(n_chunks * 4)?;
+    let idxs_buf = runtime.device.alloc_vram(n_chunks * 4)?;
+
+    let k = runtime.ensure_kernel_blockdsl("argmax_reduce", || {
+        crate::t0::argmax_kernels::build_argmax_reduce()
+    })?;
+
+    let (grid_x, _) = crate::t0::argmax_kernels::argmax_reduce_grid(n_chunks as u32);
+    let ka = crate::kernargs![
+        logits.gpu_addr() => u64,
+        vals_buf.gpu_addr() => u64,
+        idxs_buf.gpu_addr() => u64,
+        vocab_size as u32 => u32
+    ];
+    runtime.dispatch(&k, [grid_x, 1, 1], &ka)?;
+
+    let vals = runtime.read_f32(&vals_buf, n_chunks);
+    let idxs = runtime.read_f32(&idxs_buf, n_chunks);
+
+    let mut best_val = f32::NEG_INFINITY;
+    let mut best_idx = 0u32;
+    for c in 0..n_chunks {
+        if vals[c] > best_val {
+            best_val = vals[c];
+            best_idx = idxs[c] as u32;
+        }
+    }
+
+    Ok(best_idx)
 }
 
 /// CPU reference: greedy argmax over logits (for testing).

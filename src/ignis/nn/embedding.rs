@@ -21,7 +21,7 @@ pub struct Embedding {
     pub dim: usize,
     runtime: Arc<GpuRuntime>,
     /// CPU-side cached weight table (lazily populated on first forward_cpu call)
-    cached_table: std::sync::RwLock<Option<Vec<f32>>>,
+    cached_table: std::sync::RwLock<Option<std::sync::Arc<Vec<f32>>>>,
 }
 
 #[cfg(feature = "rocm")]
@@ -74,12 +74,12 @@ impl Embedding {
         let table = {
             let cached = self.cached_table.read().unwrap();
             if let Some(ref t) = *cached {
-                t.clone()
+                t.clone() // Arc clone — only increments refcount, no data copy
             } else {
                 drop(cached);
-                let t = self.weight.to_f32_vec();
+                let t = std::sync::Arc::new(self.weight.to_f32_vec());
                 let mut cached = self.cached_table.write().unwrap();
-                *cached = Some(t.clone());
+                cached.get_or_insert(t.clone());
                 t
             }
         };

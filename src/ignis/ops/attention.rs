@@ -180,13 +180,14 @@ pub fn standard_attention(
         let t2 = std::time::Instant::now();
 
         // CPU reference: scale + causal mask (debug only)
+        let is_causal = seq_len > 1;
         if crate::t0_debug() && h == 0 {
             let scores_raw = runtime.read_f32(&gemm_out, seq_len * kv_len);
             let mut cpu_scaled = vec![0.0f32; seq_len * kv_len];
             for row in 0..seq_len {
                 for col in 0..kv_len {
                     let s = scores_raw[row * kv_len + col] * scale;
-                    cpu_scaled[row * kv_len + col] = if col <= row { s } else { f32::NEG_INFINITY };
+                    cpu_scaled[row * kv_len + col] = if is_causal && col > row { f32::NEG_INFINITY } else { s };
                 }
             }
             // GPU scale

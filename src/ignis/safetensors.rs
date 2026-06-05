@@ -375,6 +375,21 @@ pub fn load_qwen3_into_model(
 
     eprintln!("[Safetensors] Loaded {} tensors, assigning to model...", all_tensors.len());
 
+    fn bf16_to_f32_tensor(
+        t: &crate::ignis::tensor::Tensor,
+        runtime: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
+    ) -> crate::ignis::tensor::Tensor {
+        if t.dtype() == crate::ignis::tensor::DType::F32 {
+            return t.clone();
+        }
+        let data = t.to_f32_vec();
+        let buf = runtime.upload_f32(&data).expect("bf16_to_f32 upload");
+        crate::ignis::tensor::Tensor::from_buffer(
+            std::sync::Arc::new(buf), runtime, t.shape(),
+            crate::ignis::tensor::DType::F32, "gamma_f32",
+        )
+    }
+
     // Helper: transpose a 2D bf16 tensor [M, N] → [N, M] as f32
     // Reads bf16 bytes, converts to f32 during transpose, uploads as f32.
     fn transpose_bf16(t: &crate::ignis::tensor::Tensor, runtime: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>) -> crate::ignis::tensor::Tensor {
@@ -468,29 +483,30 @@ pub fn load_qwen3_into_model(
             assign_weight_fast(&mut layer.w_down, w, runtime)?;
         }
 
-        // RMSNorm gammas
+        // RMSNorm gammas — pre-convert BF16→F32 at load time to avoid
+        // repeated GPU↔CPU conversions during inference (228 sync points/step)
         if let Some(w) = all_tensors.get(&format!("{}.input_layernorm.weight", prefix)) {
-            layer.attn_norm_gamma = w.clone();
+            layer.attn_norm_gamma = bf16_to_f32_tensor(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-            layer.ffn_norm_gamma = w.clone();
+            layer.ffn_norm_gamma = bf16_to_f32_tensor(w, runtime);
         }
 
-        // QK-norm weights (Qwen3-specific)
+        // QK-norm weights (Qwen3-specific) — also pre-convert
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-            layer.q_norm_gamma = w.clone();
+            layer.q_norm_gamma = bf16_to_f32_tensor(w, runtime);
         }
         if let Some(w) = all_tensors.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-            layer.k_norm_gamma = w.clone();
+            layer.k_norm_gamma = bf16_to_f32_tensor(w, runtime);
         }
 
         eprintln!("[Safetensors] Assigned layer {}", layer_idx);
     }
 
-    // Final norm
+    // Final norm — pre-convert BF16→F32
     if let Some(w) = all_tensors.get("model.norm.weight") {
-        model.final_norm_gamma = w.clone();
-        eprintln!("[Safetensors] Assigned model.norm.weight");
+        model.final_norm_gamma = bf16_to_f32_tensor(w, runtime);
+        eprintln!("[Safetensors] Assigned model.norm.weight (f32)");
     }
 
     // LM head — either weight-tied or transposed
