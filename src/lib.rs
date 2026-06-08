@@ -47,6 +47,10 @@ pub mod ignis;
 // ── GPU Profiler ──
 pub mod profiler;
 
+// ── Bare-Metal GPU Hardware Counter Profiler ──
+#[cfg(all(feature = "rocm", feature = "gfx-profiler"))]
+pub mod gfx_profiler;
+
 /// Check if T0_DEBUG environment variable is set (DEBUG mode).
 /// In RELEASE mode (default), all debug readbacks and verbose logging are disabled.
 pub fn t0_debug() -> bool {

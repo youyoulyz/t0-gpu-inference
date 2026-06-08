@@ -76,10 +76,15 @@ const PM4_IB_SIZE: usize = 256 * 1024; // 256KB for PM4 indirect buffers
 
 // PM4 opcodes for compute dispatch
 const PM4_SET_SH_REG: u32         = 0x76;
+const PM4_SET_UCONFIG_REG: u32    = 0x79;
 const PM4_DISPATCH_DIRECT: u32    = 0x15;
 const PM4_RELEASE_MEM: u32        = 0x49;
 const PM4_ACQUIRE_MEM: u32        = 0x58;
 const PM4_EVENT_WRITE: u32        = 0x46;
+
+// GFX11 GRBM_GFX_INDEX — instance targeting for per-CU counter writes
+pub const GRBM_GFX_INDEX: u32 = 0x30800;
+pub const UCONFIG_REG_BASE: u32 = 0xC000;
 
 // GFX11 Compute SH register offsets
 const SH_REG_BASE: u32              = 0x2C00;
@@ -94,8 +99,8 @@ const REG_COMPUTE_TMPRING_SIZE: u32 = 0x2C18;
 const REG_COMPUTE_RESTART_X: u32    = 0x2C88;
 
 // GFX11 event types
-const CS_PARTIAL_FLUSH: u32     = 0x07;
-const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
+pub const CS_PARTIAL_FLUSH: u32     = 0x07;
+pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
 const CACHE_FLUSH_AND_INV_TS_EVENT: u32 = 0x14;
 
 // mmap constants
@@ -2223,6 +2228,16 @@ impl Pm4CmdBuilder {
         self.pkt3(PM4_SET_SH_REG, &body);
     }
 
+    /// SET_UCONFIG_REG: write user-config registers (e.g., GRBM_GFX_INDEX for per-CU targeting)
+    /// reg_addr is the full MMIO address (e.g., 0x30800 for GRBM_GFX_INDEX).
+    pub fn set_uconfig_reg(&mut self, reg_addr: u32, values: &[u32]) {
+        let reg_offset = (reg_addr - UCONFIG_REG_BASE) >> 2;
+        let mut body = Vec::with_capacity(1 + values.len());
+        body.push(reg_offset);
+        body.extend_from_slice(values);
+        self.pkt3(PM4_SET_UCONFIG_REG, &body);
+    }
+
     /// ACQUIRE_MEM for GFX10+ (with GCR_CNTL for cache invalidation)
     pub fn acquire_mem_gfx10(&mut self) {
         // GFX10+ ACQUIRE_MEM format: 7 body dwords
@@ -2918,11 +2933,16 @@ impl DispatchPool {
     /// Additional slots are allocated on-demand when accessed.
     /// Pass 0 for default (1024 initial slots, auto-grows beyond that).
     pub fn new(device: &Arc<KfdDevice>, initial_slots: usize) -> Result<Self, String> {
+        Self::new_sized(device, initial_slots, 512)
+    }
+
+    /// Create a pool with configurable kernarg slot size.
+    pub fn new_sized(device: &Arc<KfdDevice>, initial_slots: usize, slot_size: usize) -> Result<Self, String> {
         let signal = device.alloc_signal()?;
         let n = if initial_slots == 0 { 1024 } else { initial_slots };
         let mut ring = Vec::with_capacity(n);
         for _ in 0..n {
-            ring.push(device.alloc_uncached(256)?);
+            ring.push(device.alloc_uncached(slot_size)?);
         }
         Ok(Self {
             signal,

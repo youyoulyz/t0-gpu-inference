@@ -261,6 +261,12 @@ impl TransformerLayer {
         let seq_len = x.shape()[0];
         let dbg = crate::t0_debug();
 
+        let use_defer = false && seq_len == 1;
+        if use_defer {
+            self.runtime.begin_defer_sync();
+            eprintln!("[L{}] defer_sync BEGIN", layer_idx);
+        }
+
         // === Attention sub-layer ===
         let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
 
@@ -416,6 +422,11 @@ impl TransformerLayer {
         let ffn_out = self.w_down.forward(&silu_out)?;
 
         let result = ops::add::add(&x2, &ffn_out, device)?;
+        if use_defer {
+            eprintln!("[L{}] defer_sync END (waiting...)", layer_idx);
+            self.runtime.end_defer_sync()?;
+            eprintln!("[L{}] defer_sync DONE", layer_idx);
+        }
         Ok(result)
     }
 }

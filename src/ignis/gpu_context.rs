@@ -103,6 +103,12 @@ pub struct GpuRuntime {
     /// Queue poisoned flag: set after GPU timeout/reset to prevent further dispatches
     /// that would cause cascading hangs on the already-corrupted queue.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Deferred synchronization mode: when true, dispatch() uses submit_batch()
+    /// (no doorbell ring) instead of submit() + wait_idle(). Caller must call
+    /// end_defer_sync() to ring doorbell once and synchronize.
+    defer_sync: std::sync::atomic::AtomicBool,
+    /// Number of dispatches submitted in defer_sync mode (for batch doorbell).
+    defer_count: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(feature = "rocm")]
@@ -125,6 +131,8 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            defer_sync: std::sync::atomic::AtomicBool::new(false),
+            defer_count: std::sync::atomic::AtomicU32::new(0),
         }))
     }
 
@@ -143,6 +151,8 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            defer_sync: std::sync::atomic::AtomicBool::new(false),
+            defer_count: std::sync::atomic::AtomicU32::new(0),
         }))
     }
 
@@ -285,8 +295,13 @@ impl GpuRuntime {
 
     /// Dispatch a kernel with the given grid size and kernarg data.
     ///
-    /// This is a synchronous dispatch: writes kernargs, submits, waits.
-    /// Includes pre-dispatch validation: poisoned check + kernarg VA sanity check.
+    /// When `defer_sync` mode is active (via `begin_defer_sync()`), this uses
+    /// `submit()` (write AQL packet + ring doorbell) without `wait_idle()`.
+    /// The GPU starts processing immediately, but the CPU doesn't block.
+    /// Call `end_defer_sync()` to wait for all batched dispatches.
+    ///
+    /// Without defer_sync: synchronous dispatch (submit + wait_idle).
+    /// With defer_sync: fire-and-forget dispatch (submit, no wait).
     pub fn dispatch(
         &self,
         kernel: &GpuKernel,
@@ -297,20 +312,24 @@ impl GpuRuntime {
             return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
         }
 
-        // Pre-dispatch: validate GPU VA pointers in kernargs
-        // Kernarg layout typically contains 8-byte GPU addresses followed by 4-byte scalars.
-        // Valid KFD VRAM range: 0x1_0000_0000 .. ~0x10_0000_0000 (based on next_va init)
         if std::env::var("T0_VALIDATE_KA").is_ok() {
             Self::validate_kernarg_pointers(kernargs);
         }
 
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
-        self.queue.submit(kernel, grid, ka_buf);
-        self.queue.wait_idle().map_err(|e| {
-            self.mark_poisoned();
-            e
-        })
+
+        if self.defer_sync.load(std::sync::atomic::Ordering::Relaxed) {
+            self.queue.submit(kernel, grid, ka_buf);
+            self.defer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.queue.submit(kernel, grid, ka_buf);
+            self.queue.wait_idle().map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+        }
     }
 
     /// Benchmark-optimized dispatch: AGENT fence scope + spin-wait.
@@ -411,6 +430,53 @@ impl GpuRuntime {
     /// Wait for GPU to be idle.
     pub fn wait_idle(&self) -> Result<(), String> {
         self.queue.wait_idle()
+    }
+
+    // ── Deferred synchronization (async dispatch batching) ──
+
+    /// Begin deferred synchronization mode.
+    ///
+    /// After calling this, all `dispatch()` calls will submit AQL packets
+    /// (with doorbell ring) but skip `wait_idle()`. The GPU processes
+    /// dispatches immediately, but the CPU doesn't block on each one.
+    ///
+    /// Call `end_defer_sync()` to wait for all submitted dispatches.
+    ///
+    /// This eliminates per-dispatch `wait_idle()` polling overhead, allowing
+    /// the CPU to prepare the next dispatch while the GPU executes the current
+    /// one (CPU/GPU overlap).
+    ///
+    /// Typical usage (one transformer layer):
+    /// ```ignore
+    /// runtime.begin_defer_sync();
+    /// // ... ~19 dispatches via ops that call runtime.dispatch() ...
+    /// runtime.end_defer_sync()?;  // single wait_idle for all 19
+    /// ```
+    pub fn begin_defer_sync(&self) {
+        self.defer_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.defer_count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// End deferred synchronization mode.
+    ///
+    /// Waits for all dispatches submitted during defer_sync mode to complete.
+    /// If no dispatches were submitted, this is a no-op.
+    ///
+    /// After this call, `dispatch()` reverts to synchronous behavior
+    /// (submit + wait_idle per dispatch).
+    pub fn end_defer_sync(&self) -> Result<(), String> {
+        let count = self.defer_count.load(std::sync::atomic::Ordering::Relaxed);
+        self.defer_sync.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.defer_count.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        if count > 0 {
+            self.queue.wait_idle().map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+        } else {
+            Ok(())
+        }
     }
 
     // ── BF16 weight cache ──
