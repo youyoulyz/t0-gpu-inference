@@ -2230,8 +2230,9 @@ impl Pm4CmdBuilder {
 
     /// SET_UCONFIG_REG: write user-config registers (e.g., GRBM_GFX_INDEX for per-CU targeting)
     /// reg_addr is the full MMIO address (e.g., 0x30800 for GRBM_GFX_INDEX).
+    /// For GFX11, the register offset is (reg_addr >> 2) — raw dword offset.
     pub fn set_uconfig_reg(&mut self, reg_addr: u32, values: &[u32]) {
-        let reg_offset = (reg_addr - UCONFIG_REG_BASE) >> 2;
+        let reg_offset = reg_addr >> 2;
         let mut body = Vec::with_capacity(1 + values.len());
         body.push(reg_offset);
         body.extend_from_slice(values);
