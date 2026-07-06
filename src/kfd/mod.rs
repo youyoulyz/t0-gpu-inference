@@ -79,11 +79,13 @@ const PM4_SET_SH_REG: u32         = 0x76;
 const PM4_SET_UCONFIG_REG: u32    = 0x79;
 const PM4_DISPATCH_DIRECT: u32    = 0x15;
 const PM4_RELEASE_MEM: u32        = 0x49;
+const PM4_COPY_DATA: u32          = 0x3A;
 const PM4_ACQUIRE_MEM: u32        = 0x58;
 const PM4_EVENT_WRITE: u32        = 0x46;
 
 // GFX11 GRBM_GFX_INDEX — instance targeting for per-CU counter writes
-pub const GRBM_GFX_INDEX: u32 = 0x30800;
+// MMIO address 0xC200 (used with SET_UCONFIG_REG)
+pub const GRBM_GFX_INDEX: u32 = 0xC200;
 pub const UCONFIG_REG_BASE: u32 = 0xC000;
 
 // GFX11 Compute SH register offsets
@@ -1178,11 +1180,13 @@ fn validate_kernargs_bytes(ka: &[u8], ka_size: usize) {
             );
         }
 
-        // 48-bit VA space check
-        if val > 0x0000_FFFF_FFFF_FFFF {
+        // 48-bit VA space check — only flag if top byte is non-zero.
+        // Scalar values (u32 + u16 combos) can push bits 48-55 but top byte
+        // stays zero; real host pointers on x86_64 have top byte 0x55/0x7F/etc.
+        if (val >> 56) != 0 {
             panic!(
                 "[KFD SAFETY] Kernarg offset {} contains 0x{:016X} — \
-                 outside 48-bit VA space. Likely a host pointer or uninitialized memory!\n\
+                 top byte non-zero, likely a host pointer or uninitialized memory!\n\
                  This WILL cause a GPU page fault and hard hang.",
                 offset, val
             );
@@ -2229,10 +2233,11 @@ impl Pm4CmdBuilder {
     }
 
     /// SET_UCONFIG_REG: write user-config registers (e.g., GRBM_GFX_INDEX for per-CU targeting)
-    /// reg_addr is the full MMIO address (e.g., 0x30800 for GRBM_GFX_INDEX).
-    /// For GFX11, the register offset is (reg_addr >> 2) — raw dword offset.
+    /// reg_addr is the full MMIO address (e.g., 0xC200 for GRBM_GFX_INDEX).
+    /// For GFX11, the register offset = (reg_addr - UCONFIG_REG_BASE) >> 2
+    /// where UCONFIG_REG_BASE = 0xC000.
     pub fn set_uconfig_reg(&mut self, reg_addr: u32, values: &[u32]) {
-        let reg_offset = reg_addr >> 2;
+        let reg_offset = (reg_addr - UCONFIG_REG_BASE) >> 2;
         let mut body = Vec::with_capacity(1 + values.len());
         body.push(reg_offset);
         body.extend_from_slice(values);
@@ -2316,6 +2321,29 @@ impl Pm4CmdBuilder {
             addr as u32,
             (addr >> 32) as u32,
             value,
+        ]);
+    }
+
+    /// COPY_DATA: copy a 32-bit register value to GPU memory.
+    /// Opcode 0x3A. Payload = 5 DWORDs (count=4 in header).
+    ///
+    /// Per SI Programming Guide v2 §2.9.2:
+    ///   SRC_SEL[3:0]  = 0 (Mem-mapped Register)
+    ///   DEST_SEL[11:8] = 5 (Memory async) — same as Linux kernel gfx_v11_0_ring_emit_rreg
+    ///   COUNT_SEL[16] = 0 (32-bit only; kernel never sets this for register reads)
+    ///   WR_CONFIRM[20] = 1 (wait for write completion)
+    ///   ENGINE_SEL[31:30] = 0 (ME)
+    pub fn copy_data_reg(&mut self, src_reg: u32, dst_addr: u64) {
+        let control_dw: u32 = (0u32 << 0)    // src_sel = 0 (register)
+                            | (5u32 << 8)     // dst_sel = 5 (memory async)
+                            | (0u32 << 16)    // count_sel = 0 (32-bit)
+                            | (1u32 << 20);   // wr_confirm = 1
+        self.pkt3(PM4_COPY_DATA, &[
+            control_dw,
+            src_reg,
+            0,                          // src_addr_hi (unused for register)
+            dst_addr as u32,
+            (dst_addr >> 32) as u32,
         ]);
     }
 

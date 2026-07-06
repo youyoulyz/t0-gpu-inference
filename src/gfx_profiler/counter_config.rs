@@ -16,6 +16,23 @@ pub struct CounterEvent {
     pub value_lo_reg: u32,
 }
 
+impl CounterEvent {
+    /// Return a copy of this event targeting the specified counter index (0 or 1).
+    /// Counter 0 uses SELECT0/LO0, counter 1 uses SELECT1/LO1.
+    pub fn with_counter(&self, idx: usize) -> CounterEvent {
+        let mut evt = *self;
+        if idx == 1 {
+            evt.select_reg += 4;
+            match self.block {
+                CounterBlock::SQ => evt.value_lo_reg = SQ_PERFCOUNTER1_LO,
+                CounterBlock::GRBM => evt.value_lo_reg = GRBM_PERFCOUNTER1_LO,
+                CounterBlock::TCC => evt.value_lo_reg = TCC_PERFCOUNTER1_LO,
+            }
+        }
+        evt
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CounterBlock {
     SQ,      // Per-CU shader engine counters
@@ -156,24 +173,55 @@ pub fn standard_events() -> Vec<CounterEvent> {
 /// Schedule events into profiling passes.
 ///
 /// Each pass can hold at most 2 events per counter block (RELEASE_MEM reads counter 0/1).
+/// The first event in a pair uses counter 0 (SELECT0), the second uses counter 1 (SELECT1).
 /// Returns a Vec of passes that, when executed sequentially, collect all requested events.
 pub fn schedule_passes(events: &[CounterEvent]) -> Vec<ProfilePass> {
-    let mut sq_queue: Vec<CounterEvent> = events.iter()
+    let sq_queue: Vec<CounterEvent> = events.iter()
         .filter(|e| e.block == CounterBlock::SQ).copied().collect();
-    let mut grbm_queue: Vec<CounterEvent> = events.iter()
+    let grbm_queue: Vec<CounterEvent> = events.iter()
         .filter(|e| e.block == CounterBlock::GRBM).copied().collect();
-    let mut tcc_queue: Vec<CounterEvent> = events.iter()
+    let tcc_queue: Vec<CounterEvent> = events.iter()
         .filter(|e| e.block == CounterBlock::TCC).copied().collect();
 
     let mut passes = Vec::new();
 
+    let mut sq_idx = 0usize;
+    let mut grbm_idx = 0usize;
+    let mut tcc_idx = 0usize;
+
     loop {
-        let sq0 = sq_queue.pop();
-        let sq1 = sq_queue.pop();
-        let grbm0 = grbm_queue.pop();
-        let grbm1 = grbm_queue.pop();
-        let tcc0 = tcc_queue.pop();
-        let tcc1 = tcc_queue.pop();
+        let sq0 = if sq_idx < sq_queue.len() {
+            let e = Some(sq_queue[sq_idx].with_counter(0));
+            sq_idx += 1;
+            e
+        } else { None };
+        let sq1 = if sq_idx < sq_queue.len() {
+            let e = Some(sq_queue[sq_idx].with_counter(1));
+            sq_idx += 1;
+            e
+        } else { None };
+
+        let grbm0 = if grbm_idx < grbm_queue.len() {
+            let e = Some(grbm_queue[grbm_idx].with_counter(0));
+            grbm_idx += 1;
+            e
+        } else { None };
+        let grbm1 = if grbm_idx < grbm_queue.len() {
+            let e = Some(grbm_queue[grbm_idx].with_counter(1));
+            grbm_idx += 1;
+            e
+        } else { None };
+
+        let tcc0 = if tcc_idx < tcc_queue.len() {
+            let e = Some(tcc_queue[tcc_idx].with_counter(0));
+            tcc_idx += 1;
+            e
+        } else { None };
+        let tcc1 = if tcc_idx < tcc_queue.len() {
+            let e = Some(tcc_queue[tcc_idx].with_counter(1));
+            tcc_idx += 1;
+            e
+        } else { None };
 
         if sq0.is_none() && sq1.is_none() && grbm0.is_none() &&
            grbm1.is_none() && tcc0.is_none() && tcc1.is_none() {
