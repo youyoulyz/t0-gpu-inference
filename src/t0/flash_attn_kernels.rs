@@ -12,6 +12,7 @@ pub fn build_flash_attn_decode(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel
     let head_dim_arg = kb.arg_u32("head_dim");
     let kv_len = kb.arg_u32("kv_len");
     let kv_stride = kb.arg_u32("kv_stride");
+    let n_heads = kb.arg_u32("n_heads");
 
     let tid = kb.arange(0, wg_size);
     let pid = kb.program_id(0);
@@ -20,19 +21,24 @@ pub fn build_flash_attn_decode(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel
     let kv_h_offset = kv_h.mul(&mut kb, head_dim_arg);
     let h_offset = pid.mul(&mut kb, head_dim_arg);
 
+    let zero_u = kb.const_u32(0);
+
     let d_mask = tid.lt(&mut kb, head_dim_arg);
+    // Force pid into VGPR via (pid + tid - tid) to avoid T0 scalar-cmp bug.
+    // pid (program_id) is SGPR. Adding VGPR tid forces the result to VGPR.
+    let pid_v = pid.add(&mut kb, tid).sub(&mut kb, tid);
+    let wg_mask = pid_v.lt(&mut kb, n_heads);
+    let mask = d_mask.and_bool(&mut kb, wg_mask);
 
     let q_offset = h_offset.add(&mut kb, tid);
-    let q_val = kb.load(q_ptr, q_offset, d_mask);
+    let q_val = kb.load(q_ptr, q_offset, mask);
 
     let lds_base = kb.lds_alloc((wg_size + 2) * 4);
 
     let offset_max = kb.const_u32(wg_size);
     let offset_sum = kb.const_u32(wg_size + 1);
-    let zero_u = kb.const_u32(0);
     let zero_f = kb.const_f32(0.0);
     let neg_inf = kb.const_f32(f32::NEG_INFINITY);
-    let one_u = kb.const_u32(1);
 
     kb.lds_store(lds_base, tid, zero_f);
     kb.lds_store(lds_base, offset_max, neg_inf);
@@ -47,14 +53,14 @@ pub fn build_flash_attn_decode(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel
 
         let kv_row_base = iter.mul(&mut kb, kv_stride).add(&mut kb, kv_h_offset);
         let k_offset = kv_row_base.add(&mut kb, tid);
-        let k_val = kb.load(k_ptr, k_offset, d_mask);
+        let k_val = kb.load(k_ptr, k_offset, mask);
 
         let qk = q_val.mul(&mut kb, k_val);
         let dot = kb.wg_reduce_sum(qk);
         let score = dot.mul(&mut kb, scale);
 
         let v_offset = kv_row_base.add(&mut kb, tid);
-        let v_val = kb.load(v_ptr, v_offset, d_mask);
+        let v_val = kb.load(v_ptr, v_offset, mask);
 
         let new_max = old_max.max(&mut kb, score);
         let diff_old = old_max.sub(&mut kb, new_max);
@@ -81,7 +87,7 @@ pub fn build_flash_attn_decode(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel
     let result = final_acc.mul(&mut kb, inv_sum);
 
     let out_offset = h_offset.add(&mut kb, tid);
-    kb.store(out_ptr, out_offset, result, d_mask);
+    kb.store(out_ptr, out_offset, result, mask);
 
     kb
 }

@@ -388,7 +388,8 @@ pub fn flash_attention_decode(
         scale => f32,
         head_dim as u32 => u32,
         kv_len as u32 => u32,
-        kv_stride => u32
+        kv_stride => u32,
+        n_heads as u32 => u32
     ];
 
     let (gx, _) = fak::flash_attn_decode_grid(n_heads as u32, head_dim as u32);
