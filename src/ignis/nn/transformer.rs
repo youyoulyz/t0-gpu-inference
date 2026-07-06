@@ -377,7 +377,7 @@ impl TransformerLayer {
         let k_cache = Tensor::from_gpu_addr(k_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
         let v_cache = Tensor::from_gpu_addr(v_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
 
-        // Attention — flash for decode, standard for prefill
+        // Attention — flash for decode, flash prefill for prefill
         let attn_out = if seq_len == 1 {
             ops::attention::flash_attention_decode(
                 &q, &k_cache, &v_cache,
@@ -385,9 +385,10 @@ impl TransformerLayer {
                 &self.runtime,
             )?
         } else {
-            ops::attention::standard_attention(
+            ops::attention::flash_attention_prefill(
                 &q, &k_cache, &v_cache,
                 self.n_heads, self.n_kv_heads, self.d_head,
+                write_pos,
                 &self.runtime,
             )?
         };
