@@ -9,6 +9,12 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
+use std::path::PathBuf;
+#[cfg(feature = "rocm")]
+use std::io::{Read, Write};
+#[cfg(feature = "rocm")]
+use std::fs;
+#[cfg(feature = "rocm")]
 use std::collections::HashMap;
 #[cfg(feature = "rocm")]
 use std::sync::Mutex;
@@ -92,8 +98,10 @@ pub struct GpuRuntime {
     pub pool: DispatchPool,
     /// Buffer pool — LRU cache for VRAM buffers (eliminates VA reuse race)
     pub buffer_pool: BufferPool,
-    /// Kernel compile cache: name → loaded GpuKernel
+    /// Kernel compile cache: name → loaded GpuKernel (in-memory)
     kernel_cache: Mutex<HashMap<String, Arc<GpuKernel>>>,
+    /// Persistent kernel cache directory (~/.t0/kernel_cache).
+    kernel_cache_dir: PathBuf,
     /// Next kernarg slot (monotonically increasing, wraps around pool size)
     slot_counter: Mutex<usize>,
     /// BF16 weight cache for GEMM ops: tensor_id → bf16 buffer
@@ -116,10 +124,17 @@ impl GpuRuntime {
     /// Create a new GpuRuntime.
     ///
     /// Opens the first KFD GPU device, creates a queue and dispatch pool.
+    fn cache_dir() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".t0").join("kernel_cache")
+    }
+
     pub fn new() -> Result<Arc<Self>, String> {
         let device = KfdDevice::open()?;
         let queue = device.create_queue()?;
-        let pool = DispatchPool::new(&device, 64)?; // 64 kernarg slots
+        let pool = DispatchPool::new(&device, 64)?;
+        let cache_dir = Self::cache_dir();
+        let _ = fs::create_dir_all(&cache_dir);
 
         Ok(Arc::new(Self {
             buffer_pool: BufferPool::new(&device),
@@ -127,6 +142,7 @@ impl GpuRuntime {
             queue,
             pool,
             kernel_cache: Mutex::new(HashMap::new()),
+            kernel_cache_dir: cache_dir,
             slot_counter: Mutex::new(0),
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
@@ -140,6 +156,8 @@ impl GpuRuntime {
     pub fn with_device(device: Arc<KfdDevice>) -> Result<Arc<Self>, String> {
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?;
+        let cache_dir = Self::cache_dir();
+        let _ = fs::create_dir_all(&cache_dir);
 
         Ok(Arc::new(Self {
             buffer_pool: BufferPool::new(&device),
@@ -147,6 +165,7 @@ impl GpuRuntime {
             queue,
             pool,
             kernel_cache: Mutex::new(HashMap::new()),
+            kernel_cache_dir: cache_dir,
             slot_counter: Mutex::new(0),
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
@@ -185,19 +204,24 @@ impl GpuRuntime {
         wg_size: [u32; 3],
         lds_override: u32,
     ) -> Result<Arc<GpuKernel>, String> {
-        let mut cache = self.kernel_cache.lock().unwrap();
-        if let Some(k) = cache.get(name) {
-            return Ok(k.clone());
+        // Check in-memory cache
+        {
+            let cache = self.kernel_cache.lock().unwrap();
+            if let Some(k) = cache.get(name) {
+                return Ok(k.clone());
+            }
+        }
+        // Check disk cache
+        if let Some(k) = self.try_load_disk_cache(name) {
+            return Ok(k);
         }
 
         let t0k = builder();
-        let wg_actual = [t0k.wg_size(), 1, 1]; // use wg from kernel, not hardcoded
+        let wg_actual = [t0k.wg_size(), 1, 1];
         let elf = t0k.compile(crate::t0::ir::Target::GFX1100)?;
         let lds = if lds_override > 0 { lds_override } else { t0k.lds_size() };
-        let config = KernelLoadConfig {
-            workgroup_size: if wg_size[0] > 0 { wg_size } else { wg_actual },
-            lds_size: lds,
-        };
+        let wg = if wg_size[0] > 0 { wg_size } else { wg_actual };
+        let config = KernelLoadConfig { workgroup_size: wg, lds_size: lds };
 
         // Auto-cache args metadata
         let args_meta: Vec<crate::t0::dsl::KernArgMeta> = t0k.args().iter().map(|a| {
@@ -221,9 +245,15 @@ impl GpuRuntime {
             });
         }
 
+        // Save to disk cache
+        self.save_kernel_cache(name, &elf, wg, lds);
+
         let kernel = GpuKernel::load(&self.device, &elf, &config)?;
         let kernel_arc = Arc::new(kernel);
-        cache.insert(name.to_string(), kernel_arc.clone());
+        {
+            let mut cache = self.kernel_cache.lock().unwrap();
+            cache.insert(name.to_string(), kernel_arc.clone());
+        }
         Ok(kernel_arc)
     }
 
@@ -238,9 +268,16 @@ impl GpuRuntime {
         name: &str,
         builder: impl FnOnce() -> crate::t0::block_dsl::BlockKernel,
     ) -> Result<Arc<GpuKernel>, String> {
-        let mut cache = self.kernel_cache.lock().unwrap();
-        if let Some(k) = cache.get(name) {
-            return Ok(k.clone());
+        // Check in-memory cache
+        {
+            let cache = self.kernel_cache.lock().unwrap();
+            if let Some(k) = cache.get(name) {
+                return Ok(k.clone());
+            }
+        }
+        // Check disk cache
+        if let Some(k) = self.try_load_disk_cache(name) {
+            return Ok(k);
         }
 
         let kb = builder();
@@ -251,9 +288,16 @@ impl GpuRuntime {
             workgroup_size: ck.workgroup_size,
             lds_size: ck.lds_size,
         };
+
+        // Save to disk cache
+        self.save_kernel_cache(name, &ck.elf, ck.workgroup_size, ck.lds_size);
+
         let kernel = GpuKernel::load(&self.device, &ck.elf, &config)?;
         let kernel_arc = Arc::new(kernel);
-        cache.insert(name.to_string(), kernel_arc.clone());
+        {
+            let mut cache = self.kernel_cache.lock().unwrap();
+            cache.insert(name.to_string(), kernel_arc.clone());
+        }
         Ok(kernel_arc)
     }
 
@@ -267,9 +311,16 @@ impl GpuRuntime {
         builder: F,
     ) -> Result<Arc<GpuKernel>, String>
     where F: FnOnce() -> Result<(Vec<u8>, [u32; 3], u32), String> {
-        let mut cache = self.kernel_cache.lock().unwrap();
-        if let Some(k) = cache.get(name) {
-            return Ok(k.clone());
+        // Check in-memory cache
+        {
+            let cache = self.kernel_cache.lock().unwrap();
+            if let Some(k) = cache.get(name) {
+                return Ok(k.clone());
+            }
+        }
+        // Check disk cache
+        if let Some(k) = self.try_load_disk_cache(name) {
+            return Ok(k);
         }
 
         let (elf, wg_size, lds_size) = builder()?;
@@ -277,9 +328,16 @@ impl GpuRuntime {
             workgroup_size: wg_size,
             lds_size,
         };
+
+        // Save to disk cache
+        self.save_kernel_cache(name, &elf, wg_size, lds_size);
+
         let kernel = GpuKernel::load(&self.device, &elf, &config)?;
         let kernel_arc = Arc::new(kernel);
-        cache.insert(name.to_string(), kernel_arc.clone());
+        {
+            let mut cache = self.kernel_cache.lock().unwrap();
+            cache.insert(name.to_string(), kernel_arc.clone());
+        }
         Ok(kernel_arc)
     }
 
@@ -615,6 +673,53 @@ impl GpuRuntime {
 
 
     /// Get cached args metadata for a kernel (for manual build_kernargs).
+    /// Load a compiled kernel from disk cache. Returns (elf, wg_size, lds_size).
+    fn load_kernel_cache(&self, name: &str) -> Option<(Vec<u8>, [u32; 3], u32)> {
+        let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        let path = self.kernel_cache_dir.join(&safe_name);
+        let mut f = fs::File::open(&path).ok()?;
+        let mut header = [0u8; 24];
+        f.read_exact(&mut header).ok()?;
+        if &header[0..4] != b"T0KC" { return None; }
+        let elf_len = u64::from_le_bytes(header[4..12].try_into().ok()?) as usize;
+        let wg_x = u32::from_le_bytes(header[12..16].try_into().ok()?);
+        let wg_y = u32::from_le_bytes(header[16..20].try_into().ok()?);
+        let wg_z = u32::from_le_bytes(header[20..24].try_into().ok()?);
+        // lds_size follows
+        let mut lds_bytes = [0u8; 4];
+        f.read_exact(&mut lds_bytes).ok()?;
+        let lds = u32::from_le_bytes(lds_bytes);
+        let mut elf = vec![0u8; elf_len];
+        f.read_exact(&mut elf).ok()?;
+        Some((elf, [wg_x, wg_y, wg_z], lds))
+    }
+
+    /// Save a compiled kernel to disk cache.
+    fn save_kernel_cache(&self, name: &str, elf: &[u8], wg_size: [u32; 3], lds: u32) {
+        let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        let path = self.kernel_cache_dir.join(&safe_name);
+        if let Ok(mut f) = fs::File::create(&path) {
+            let _ = f.write_all(b"T0KC");
+            let _ = f.write_all(&(elf.len() as u64).to_le_bytes());
+            let _ = f.write_all(&wg_size[0].to_le_bytes());
+            let _ = f.write_all(&wg_size[1].to_le_bytes());
+            let _ = f.write_all(&wg_size[2].to_le_bytes());
+            let _ = f.write_all(&lds.to_le_bytes());
+            let _ = f.write_all(elf);
+        }
+    }
+
+    /// Try to load a kernel from disk cache into in-memory cache. Returns true if loaded.
+    fn try_load_disk_cache(&self, name: &str) -> Option<Arc<GpuKernel>> {
+        let (elf, wg, lds) = self.load_kernel_cache(name)?;
+        let config = KernelLoadConfig { workgroup_size: wg, lds_size: lds };
+        let kernel = GpuKernel::load(&self.device, &elf, &config).ok()?;
+        let arc = Arc::new(kernel);
+        let mut cache = self.kernel_cache.lock().unwrap();
+        cache.insert(name.to_string(), arc.clone());
+        Some(arc)
+    }
+
     pub fn get_kernel_info(&self, name: &str) -> Option<CachedKernelInfo> {
         let cache = self.args_cache.lock().unwrap();
         cache.get(name).cloned()
