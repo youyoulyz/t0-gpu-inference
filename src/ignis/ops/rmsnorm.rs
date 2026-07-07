@@ -14,6 +14,8 @@ use crate::kfd::{GpuBuffer, KfdDevice};
 use super::super::tensor::Tensor;
 #[cfg(feature = "rocm")]
 use super::super::tape::Tape;
+#[cfg(feature = "rocm")]
+use super::super::gpu_context::GpuRuntime;
 
 const DEFAULT_EPSILON: f32 = 1e-6;
 
@@ -632,6 +634,60 @@ pub fn rmsnorm_eps(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>, eps: f3
     }
 
     Ok(output)
+}
+
+/// Fused RMSNorm → bf16: computes rmsnorm and writes output directly as bf16.
+///
+/// Eliminates the separate f32→bf16 conversion dispatch by producing bf16
+/// output suitable for direct GEMM consumption.
+///
+/// Returns a bf16 GpuBuffer [rows, dim] with row stride `out_stride` bf16 elements.
+/// The buffer is pre-zeroed; extra rows (rows..rows_padded) and columns (dim..out_stride)
+/// remain zero for GEMM tile padding.
+///
+/// `out_stride`: padded K dimension in bf16 elements (must be >= dim, tile-aligned).
+#[cfg(feature = "rocm")]
+pub fn rmsnorm_to_bf16(
+    x: &Tensor,
+    gamma: &Tensor,
+    rows: usize,
+    dim: usize,
+    out_stride: usize,
+    rows_padded: usize,
+    runtime: &Arc<GpuRuntime>,
+) -> Result<GpuBuffer, String> {
+    crate::profile_scope!("rmsnorm_to_bf16");
+    use crate::t0::rmsnorm_kernels as rk;
+
+    // Ensure gamma is f32 (convert bf16→f32 if needed)
+    let _gamma_hold;
+    let gamma_addr = if gamma.dtype() == super::super::tensor::DType::BF16 {
+        let data = gamma.to_f32_vec();
+        _gamma_hold = runtime.upload_f32(&data)?;
+        _gamma_hold.gpu_addr()
+    } else {
+        gamma.buffer_arc().gpu_addr()
+    };
+
+    let bf16_bytes = rows_padded * out_stride * 2;
+    let alloc_bytes = (bf16_bytes + 255) & !255;
+    let out_buf = runtime.alloc(alloc_bytes)?;
+    out_buf.zero();
+
+    let kernel = runtime.ensure_kernel_blockdsl("rmsnorm_to_bf16", || rk::build_rmsnorm_to_bf16())?;
+    let (grid_x, _) = rk::rmsnorm_to_bf16_grid(rows as u32);
+
+    let ka = crate::kernargs![
+        x.buffer_arc().gpu_addr() => u64,
+        gamma_addr => u64,
+        out_buf.gpu_addr() => u64,
+        dim as u32 => u32,
+        1e-6f32 => f32,
+        out_stride as u32 => u32
+    ];
+    runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
+
+    Ok(out_buf)
 }
 
 #[cfg(feature = "rocm")]

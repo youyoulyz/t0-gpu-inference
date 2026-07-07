@@ -221,6 +221,45 @@ pub fn matmul_with_wt_bf16(
     Ok(Tensor::from_buffer(Arc::new(y_buf), runtime, &[m, n], DType::F32, "matmul_wt_out"))
 }
 
+/// MatMul with pre-converted bf16 X (skips f32→bf16 conversion dispatch).
+///
+/// Use when X has already been converted to bf16 (e.g., by rmsnorm_to_bf16).
+/// `x_bf16` is a bf16 buffer [m_pad, k] with the same layout as
+/// `f32_to_bf16_gpu_padded` would produce.
+#[cfg(feature = "rocm")]
+pub fn matmul_with_bf16_x(
+    x_bf16: &GpuBuffer,
+    wt_bf16: &GpuBuffer,
+    m: usize, k: usize, n: usize,
+    runtime: &Arc<GpuRuntime>,
+) -> Result<Tensor, String> {
+    crate::profile_scope!("matmul_wt_bf16");
+    use crate::t0::gemm_gen::{self, GemmConfig};
+
+    let cfg = select_config(m);
+    let m_pad = pad_tile(m, cfg.tile_m);
+    let n_pad = pad_tile(n, cfg.tile_n);
+
+    let kernel = runtime.ensure_kernel_t0(
+        &cfg.name(),
+        || gemm_gen::generate(&cfg),
+        [cfg.wg_size, 1, 1],
+        cfg.lds_total(),
+    )?;
+
+    let y_buf = runtime.alloc_f32(m_pad * n_pad)?;
+    y_buf.zero();
+
+    let ka = gemm_gen::build_kernargs(
+        x_bf16.gpu_addr(), wt_bf16.gpu_addr(), y_buf.gpu_addr(),
+        k as u32, n as u32, m as u32, &cfg,
+    );
+    let (gx, gy) = gemm_gen::compute_grid_auto(&cfg, m as u32, n as u32);
+    runtime.dispatch(&kernel, [gx, gy, 1], &ka)?;
+
+    Ok(Tensor::from_buffer(Arc::new(y_buf), runtime, &[m, n], DType::F32, "matmul_wt_out"))
+}
+
 /// Raw f32 GEMM using bf16 WMMA pipeline (for attention and other inference ops).
 ///
 /// Computes Y[M,N] = A[M,K] @ B[K,N] on GPU. All buffers are f32 GpuBuffers.

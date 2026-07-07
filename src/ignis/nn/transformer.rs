@@ -268,14 +268,20 @@ impl TransformerLayer {
         }
 
         // === Attention sub-layer ===
-        let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
+        // For decode, fuse rmsnorm + f32→bf16 conversion to save 1 dispatch
+        let attn_pad_k = (self.dim as u32 + 15) / 16 * 16;
 
-        // Q/K/V projections — fused for decode (1 GEMM vs 3), separate for prefill
-        let (q, k, v, _qkv_holder) = if seq_len == 1 {
+        // h_attn holds the rmsnorm output in f32 (for prefill/debug) or None (fused decode)
+        let (q, k, v, _qkv_holder, h_attn) = if seq_len == 1 {
             if let Some(Some(wt)) = self.wqkv_bf16.get() {
                 let n_fused = self.q_dim + 2 * self.kv_dim;
-                let qkv = ops::bf16_matmul::matmul_with_wt_bf16(
-                    &h, wt, 1, self.dim, n_fused, &self.runtime,
+                // Fused: rmsnorm → bf16 (single dispatch, skips f32 output)
+                let h_bf16 = ops::rmsnorm::rmsnorm_to_bf16(
+                    x, &self.attn_norm_gamma, 1, self.dim,
+                    attn_pad_k as usize, 16, &self.runtime,
+                )?;
+                let qkv = ops::bf16_matmul::matmul_with_bf16_x(
+                    &h_bf16, wt, 1, self.dim, n_fused, &self.runtime,
                 )?;
                 let base = qkv.gpu_addr();
                 let q = Tensor::from_gpu_addr(base, &self.runtime, &[1, self.q_dim], "q_fused");
@@ -286,26 +292,30 @@ impl TransformerLayer {
                     base + ((self.q_dim + self.kv_dim) * 4) as u64,
                     &self.runtime, &[1, self.kv_dim], "v_fused",
                 );
-                (q, k, v, Some(qkv))
+                (q, k, v, Some(qkv), None)
             } else {
-                (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None)
+                let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
+                (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None, Some(h))
             }
         } else {
-            (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None)
+            let h = ops::rmsnorm::rmsnorm(x, &self.attn_norm_gamma, device)?;
+            (self.wq.forward(&h)?, self.wk.forward(&h)?, self.wv.forward(&h)?, None, Some(h))
         };
 
         if dbg && layer_idx == 0 {
-            let hd = h.to_f32_vec();
             let qd = q.to_f32_vec();
             let kd = k.to_f32_vec();
             let vd = v.to_f32_vec();
-            let last_h = (seq_len - 1) * self.dim;
             let last_q = (seq_len - 1) * self.q_dim;
             let last_k = (seq_len - 1) * self.kv_dim;
             let last_v = (seq_len - 1) * self.kv_dim;
-            eprintln!("  [L0] h_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-                hd[last_h], hd[last_h+1], hd[last_h+2], hd[last_h+3],
-                hd[last_h+4], hd[last_h+5], hd[last_h+6], hd[last_h+7]);
+            if let Some(ref h) = h_attn {
+                let hd = h.to_f32_vec();
+                let last_h = (seq_len - 1) * self.dim;
+                eprintln!("  [L0] h_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                    hd[last_h], hd[last_h+1], hd[last_h+2], hd[last_h+3],
+                    hd[last_h+4], hd[last_h+5], hd[last_h+6], hd[last_h+7]);
+            }
             eprintln!("  [L0] Q_last[:8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
                 qd[last_q], qd[last_q+1], qd[last_q+2], qd[last_q+3],
                 qd[last_q+4], qd[last_q+5], qd[last_q+6], qd[last_q+7]);
@@ -398,13 +408,18 @@ impl TransformerLayer {
         let x2 = ops::add::add(x, &proj_out, device)?;
 
         // === FFN sub-layer ===
-        let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
+        let ffn_pad_k = (self.dim as u32 + 15) / 16 * 16;
 
         let (gate, up, _gu_holder) = if seq_len == 1 {
             if let Some(Some(wt)) = self.wgu_bf16.get() {
                 let n_fused = 2 * self.ffn_dim;
-                let gu = ops::bf16_matmul::matmul_with_wt_bf16(
-                    &h2, wt, 1, self.dim, n_fused, &self.runtime,
+                // Fused: rmsnorm → bf16 (single dispatch, skips f32 output)
+                let h2_bf16 = ops::rmsnorm::rmsnorm_to_bf16(
+                    &x2, &self.ffn_norm_gamma, 1, self.dim,
+                    ffn_pad_k as usize, 16, &self.runtime,
+                )?;
+                let gu = ops::bf16_matmul::matmul_with_bf16_x(
+                    &h2_bf16, wt, 1, self.dim, n_fused, &self.runtime,
                 )?;
                 let base = gu.gpu_addr();
                 let gate = Tensor::from_gpu_addr(base, &self.runtime, &[1, self.ffn_dim], "gate_fused");
@@ -413,9 +428,11 @@ impl TransformerLayer {
                 );
                 (gate, up, Some(gu))
             } else {
+                let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
                 (self.w_gate.forward(&h2)?, self.w_up.forward(&h2)?, None)
             }
         } else {
+            let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
             (self.w_gate.forward(&h2)?, self.w_up.forward(&h2)?, None)
         };
 

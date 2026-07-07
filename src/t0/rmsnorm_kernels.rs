@@ -254,6 +254,70 @@ pub fn build_rmsnorm_residual_add() -> BlockKernel {
     kb
 }
 
+/// Build fused RMSNorm → bf16 kernel.
+///
+/// Computes rmsnorm and writes output directly as bf16 (no separate f32→bf16 dispatch).
+/// The bf16 buffer must be pre-allocated and zero-padded to tile dimensions.
+///
+/// Kernarg layout: [x:u64, weight:u64, out_bf16:u64, cols:u32, eps:f32, out_stride:u32]
+/// Grid: (rows * WG_SIZE, 1, 1) — one WG per row
+pub fn build_rmsnorm_to_bf16() -> BlockKernel {
+    let wg: u32 = 256;
+    let mut kb = BlockKernel::new("rmsnorm_to_bf16", wg);
+
+    let x_ptr = kb.arg_ptr("x");         // f32 input
+    let weight_ptr = kb.arg_ptr("weight"); // f32 weight
+    let out_ptr = kb.arg_ptr("out");      // bf16 output
+    let cols = kb.arg_u32("cols");        // K dimension
+    let eps = kb.arg_f32("eps");
+    let out_stride = kb.arg_u32("out_stride"); // padded K in bf16 elements
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+    let zero_f = kb.const_f32(0.0);
+    let zero = kb.const_u32(0);
+
+    let row_base = pid.mul(&mut kb, cols);
+
+    // Phase 1: sum(x²) via for_range_acc
+    let (iter1, sum_sq) = kb.for_range_acc(zero, cols, wg, zero_f);
+    {
+        let col = iter1.add(&mut kb, tid);
+        let in_bounds = col.lt(&mut kb, cols);
+        let offset = row_base.add(&mut kb, col);
+        let x = kb.load(x_ptr, offset, in_bounds);
+        let x_sq = x.mul(&mut kb, x);
+        let x_sq_masked = in_bounds.select(&mut kb, x_sq, zero_f);
+        let new_acc = sum_sq.add(&mut kb, x_sq_masked);
+        let _ = kb.end_for_acc(iter1, new_acc);
+    }
+
+    // Phase 2: wg_reduce_sum + rstd
+    let sum_sq = kb.wg_reduce_sum(sum_sq);
+    let cols_f = cols.to_f32(&mut kb);
+    let mean_sq = sum_sq.div(&mut kb, cols_f);
+    let rstd = mean_sq.add(&mut kb, eps).rsqrt(&mut kb);
+
+    // Phase 3: normalize + scale + store as bf16
+    let out_row = pid.mul(&mut kb, out_stride);
+    let iter2 = kb.for_range(zero, cols, wg);
+    {
+        let col = iter2.add(&mut kb, tid);
+        let in_bounds = col.lt(&mut kb, cols);
+        let x_off = row_base.add(&mut kb, col);
+        let x = kb.load(x_ptr, x_off, in_bounds);
+        let w = kb.load(weight_ptr, col, in_bounds);
+        let normed = x.mul(&mut kb, rstd).mul(&mut kb, w);
+        let out_off = out_row.add(&mut kb, col);
+        kb.store_bf16(out_ptr, out_off, normed, in_bounds);
+    }
+    kb.end_for(iter2);
+
+    kb
+}
+
+pub fn rmsnorm_to_bf16_grid(rows: u32) -> (u32, u32) { (rows * 256, 1) }
+
 /// CPU reference: fused RMSNorm + Residual Add
 pub fn cpu_rmsnorm_residual_add(
     input: &[f32], weight: &[f32], output: &mut [f32],
@@ -316,6 +380,15 @@ mod tests {
         let ck = kb.compile_via_ssa(Target::GFX1100).expect("rmsnorm bwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RMSNorm backward: {} bytes ELF, wg={:?}, lds={}",
+            ck.elf.len(), ck.workgroup_size, ck.lds_size);
+    }
+
+    #[test]
+    fn test_rmsnorm_to_bf16_compiles() {
+        let kb = build_rmsnorm_to_bf16();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("rmsnorm_to_bf16 compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ RMSNorm→bf16: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
     }
 
