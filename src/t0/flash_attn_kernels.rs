@@ -92,6 +92,98 @@ pub fn build_flash_attn_decode(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel
     kb
 }
 
+pub fn build_flash_attn_decode_bf16(head_dim: u32, gqa_ratio_log2: u8) -> BlockKernel {
+    let wg_size = head_dim;
+    let mut kb = BlockKernel::new("flash_attn_decode_bf16", wg_size);
+
+    let q_ptr = kb.arg_ptr("Q");
+    let k_ptr = kb.arg_ptr("K");
+    let v_ptr = kb.arg_ptr("V");
+    let out_ptr = kb.arg_ptr("out");
+    let scale = kb.arg_f32("scale");
+    let head_dim_arg = kb.arg_u32("head_dim");
+    let kv_len = kb.arg_u32("kv_len");
+    let kv_stride = kb.arg_u32("kv_stride");
+    let n_heads = kb.arg_u32("n_heads");
+    let out_stride = kb.arg_u32("out_stride");
+
+    let tid = kb.arange(0, wg_size);
+    let pid = kb.program_id(0);
+
+    let kv_h = pid.shr(&mut kb, gqa_ratio_log2);
+    let kv_h_offset = kv_h.mul(&mut kb, head_dim_arg);
+    let h_offset = pid.mul(&mut kb, head_dim_arg);
+
+    let zero_u = kb.const_u32(0);
+
+    let d_mask = tid.lt(&mut kb, head_dim_arg);
+    let pid_v = pid.add(&mut kb, tid).sub(&mut kb, tid);
+    let wg_mask = pid_v.lt(&mut kb, n_heads);
+    let mask = d_mask.and_bool(&mut kb, wg_mask);
+
+    let q_offset = h_offset.add(&mut kb, tid);
+    let q_val = kb.load(q_ptr, q_offset, mask);
+
+    let lds_base = kb.lds_alloc((wg_size + 2) * 4);
+
+    let offset_max = kb.const_u32(wg_size);
+    let offset_sum = kb.const_u32(wg_size + 1);
+    let zero_f = kb.const_f32(0.0);
+    let neg_inf = kb.const_f32(f32::NEG_INFINITY);
+
+    kb.lds_store(lds_base, tid, zero_f);
+    kb.lds_store(lds_base, offset_max, neg_inf);
+    kb.lds_store(lds_base, offset_sum, zero_f);
+    kb.barrier();
+
+    let iter = kb.for_range(zero_u, kv_len, 1);
+    {
+        let old_max = kb.lds_load(lds_base, offset_max);
+        let old_sum = kb.lds_load(lds_base, offset_sum);
+        let old_acc = kb.lds_load(lds_base, tid);
+
+        let kv_row_base = iter.mul(&mut kb, kv_stride).add(&mut kb, kv_h_offset);
+        let k_offset = kv_row_base.add(&mut kb, tid);
+        let k_val = kb.load(k_ptr, k_offset, mask);
+
+        let qk = q_val.mul(&mut kb, k_val);
+        let dot = kb.wg_reduce_sum(qk);
+        let score = dot.mul(&mut kb, scale);
+
+        let v_offset = kv_row_base.add(&mut kb, tid);
+        let v_val = kb.load(v_ptr, v_offset, mask);
+
+        let new_max = old_max.max(&mut kb, score);
+        let diff_old = old_max.sub(&mut kb, new_max);
+        let correction = diff_old.exp(&mut kb);
+        let diff_score = score.sub(&mut kb, new_max);
+        let exp_score = diff_score.exp(&mut kb);
+
+        let old_sum_scaled = old_sum.mul(&mut kb, correction);
+        let new_sum = old_sum_scaled.add(&mut kb, exp_score);
+        let weighted_v = exp_score.mul(&mut kb, v_val);
+        let old_acc_scaled = old_acc.mul(&mut kb, correction);
+        let new_acc = old_acc_scaled.add(&mut kb, weighted_v);
+
+        kb.lds_store(lds_base, tid, new_acc);
+        kb.lds_store(lds_base, offset_max, new_max);
+        kb.lds_store(lds_base, offset_sum, new_sum);
+        kb.barrier();
+    }
+    kb.end_for(iter);
+
+    let final_sum = kb.lds_load(lds_base, offset_sum);
+    let final_acc = kb.lds_load(lds_base, tid);
+    let inv_sum = final_sum.rcp(&mut kb);
+    let result = final_acc.mul(&mut kb, inv_sum);
+
+    // bf16 output at row 0, column h*head_dim + tid, padded to out_stride
+    let out_offset = h_offset.add(&mut kb, tid);
+    kb.store_bf16(out_ptr, out_offset, result, mask);
+
+    kb
+}
+
 pub fn flash_attn_decode_grid(n_heads: u32, head_dim: u32) -> (u32, u32) {
     (n_heads * head_dim, 1)
 }

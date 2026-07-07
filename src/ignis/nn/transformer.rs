@@ -387,24 +387,35 @@ impl TransformerLayer {
         let k_cache = Tensor::from_gpu_addr(k_addr, &self.runtime, &[kv_len, self.kv_dim], "k_cache");
         let v_cache = Tensor::from_gpu_addr(v_addr, &self.runtime, &[kv_len, self.kv_dim], "v_cache");
 
-        // Attention — flash for decode, flash prefill for prefill
-        let attn_out = if seq_len == 1 {
-            ops::attention::flash_attention_decode(
+        // Attention — flash for decode, flash prefill for prefill.
+        // For decode, output bf16 directly to skip f32→bf16 conversion in Wo matmul.
+        let proj_out = if seq_len == 1 {
+            let attn_bf16 = ops::attention::flash_attention_decode_to_bf16(
                 &q, &k_cache, &v_cache,
                 self.n_heads, self.n_kv_heads, self.d_head,
+                16, // m_pad for tile_16x64_k16
                 &self.runtime,
-            )?
+            )?;
+            // Wo projection with bf16 X input (saves f32→bf16 dispatch)
+            if let Some(wo_wt) = self.wo.get_cached_wt_bf16() {
+                ops::bf16_matmul::matmul_with_bf16_x(
+                    &attn_bf16, &wo_wt, 1, self.q_dim, self.dim, &self.runtime,
+                )?
+            } else {
+                // Fallback: convert bf16→f32 tensor, then normal matmul
+                let attn_f32 = Tensor::from_gpu_addr(
+                    attn_bf16.gpu_addr(), &self.runtime, &[1, self.q_dim], "attn_out");
+                self.wo.forward(&attn_f32)?
+            }
         } else {
-            ops::attention::flash_attention_prefill(
+            let attn_out = ops::attention::flash_attention_prefill(
                 &q, &k_cache, &v_cache,
                 self.n_heads, self.n_kv_heads, self.d_head,
                 write_pos,
                 &self.runtime,
-            )?
+            )?;
+            self.wo.forward(&attn_out)?
         };
-
-        // Output projection
-        let proj_out = self.wo.forward(&attn_out)?;
         let x2 = ops::add::add(x, &proj_out, device)?;
 
         // === FFN sub-layer ===
@@ -436,8 +447,21 @@ impl TransformerLayer {
             (self.w_gate.forward(&h2)?, self.w_up.forward(&h2)?, None)
         };
 
-        let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-        let ffn_out = self.w_down.forward(&silu_out)?;
+        // For decode, fuse silu→bf16 to save downstream W_down matmul's f32→bf16 dispatch
+        let ffn_out = if seq_len == 1 {
+            if let Some(wt) = self.w_down.get_cached_wt_bf16() {
+                let silu_bf16 = ops::silu::silu_gate_to_bf16(&gate, &up, 16)?;
+                ops::bf16_matmul::matmul_with_bf16_x(
+                    &silu_bf16, wt, 1, self.ffn_dim, self.dim, &self.runtime,
+                )?
+            } else {
+                let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+                self.w_down.forward(&silu_out)?
+            }
+        } else {
+            let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+            self.w_down.forward(&silu_out)?
+        };
 
         let result = ops::add::add(&x2, &ffn_out, device)?;
         if use_defer {

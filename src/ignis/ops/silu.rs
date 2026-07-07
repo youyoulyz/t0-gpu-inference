@@ -15,6 +15,66 @@ use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
 use super::super::tape::Tape;
 
+/// Fused SiLU-gate → bf16 output (for downstream W_down matmul).
+///
+/// Same computation as silu_gate but writes bf16 directly to a GEMM-ready
+/// padded buffer, saving the f32→bf16 conversion dispatch.
+#[cfg(feature = "rocm")]
+pub fn silu_gate_to_bf16(
+    gate: &Tensor, up: &Tensor,
+    m_pad: usize,  // padded M dimension for GEMM (e.g., 16)
+) -> Result<GpuBuffer, String> {
+    crate::profile_scope!("silu_gate_bf16");
+    assert_eq!(gate.shape(), up.shape(), "silu_gate_to_bf16: shape mismatch");
+    let n = gate.numel();
+    let runtime = gate.runtime();
+
+    let kernel = {
+        let cached = runtime.get_kernel("bdsl_silu_to_bf16");
+        if let Some(k) = cached {
+            k
+        } else {
+            use crate::t0::block_dsl::BlockKernel;
+            use crate::t0::ir::Target;
+            let mut kb = BlockKernel::new("bdsl_silu_to_bf16", 256);
+            let gate_ptr = kb.arg_ptr("gate");
+            let up_ptr = kb.arg_ptr("up");
+            let out_ptr = kb.arg_ptr("out");
+            let n_arg = kb.arg_u32("n");
+
+            let pid = kb.program_id(0);
+            let bs = kb.const_u32(256);
+            let base = pid.mul(&mut kb, bs);
+            let tid = kb.arange(0, 256);
+            let off = tid.add(&mut kb, base);
+
+            let g = kb.load_checked(gate_ptr, off, n_arg);
+            let u = kb.load_checked(up_ptr, off, n_arg);
+            let result = g.silu(&mut kb).mul(&mut kb, u);
+            kb.store_bf16_checked(out_ptr, off, result, n_arg);
+
+            let compiled = kb.compile(Target::GFX1100)?;
+            runtime.compile_dsl(compiled)?
+        }
+    };
+
+    let bf16_bytes = m_pad * n * 2;
+    let alloc_bytes = (bf16_bytes + 255) & !255;
+    let out_buf = runtime.alloc(alloc_bytes)?;
+    out_buf.zero();
+
+    let grid_x = ((n as u32 + 255) / 256) * 256;
+    let ka = crate::kernargs![
+        gate.gpu_addr() => u64,
+        up.gpu_addr() => u64,
+        out_buf.gpu_addr() => u64,
+        n as u32 => u32
+    ];
+    runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
+
+    Ok(out_buf)
+}
+
 /// Fused SiLU-gate multiplication: output = silu(gate) * up
 ///
 /// This is the FFN computation: gate_proj → SiLU → elementwise_mul(up_proj)

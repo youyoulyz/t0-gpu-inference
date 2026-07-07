@@ -77,6 +77,17 @@ impl Linear {
     pub fn set_cached_wt_bf16(&self, wt_bf16: crate::kfd::GpuBuffer) {
         let _ = self.cached_wt_bf16.set(Some(wt_bf16));
     }
+
+    /// Get (or compute) the cached bf16 transposed weight.
+    pub fn get_cached_wt_bf16(&self) -> Option<&crate::kfd::GpuBuffer> {
+        let val = self.cached_wt_bf16.get_or_init(|| {
+            let wt = super::super::ops::bf16_matmul::precompute_wt_bf16(
+                &self.runtime, self.weight.buffer(), self.in_features, self.out_features,
+            );
+            Some(wt.ok()).flatten()
+        });
+        val.as_ref()
+    }
 }
 
 #[cfg(feature = "rocm")]

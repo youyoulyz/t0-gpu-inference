@@ -13,6 +13,8 @@ use std::sync::Arc;
 use super::super::tensor::Tensor;
 #[cfg(feature = "rocm")]
 use super::super::gpu_context::GpuRuntime;
+#[cfg(feature = "rocm")]
+use crate::kfd::GpuBuffer;
 
 /// Standard scaled dot-product attention with GQA (GPU implementation).
 ///
@@ -479,6 +481,63 @@ pub fn flash_attention_prefill(
     Ok(Tensor::from_buffer(Arc::new(out_buf), runtime,
         &[seq_len, n_heads * head_dim],
         super::super::tensor::DType::F32, "flash_prefill_out"))
+}
+
+/// Flash Attention decode → bf16 output (for downstream matmul).
+///
+/// Same algorithm as flash_attention_decode but writes bf16 output directly
+/// to a padded buffer ready for GEMM consumption. Skips f32→bf16 dispatch.
+#[cfg(feature = "rocm")]
+pub fn flash_attention_decode_to_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    m_pad: usize,  // padded M dimension for GEMM (e.g., 16)
+    runtime: &Arc<GpuRuntime>,
+) -> Result<GpuBuffer, String> {
+    crate::profile_scope!("flash_attn_decode_bf16");
+    use crate::t0::flash_attn_kernels as fak;
+
+    let q_shape = q.shape();
+    let k_shape = k.shape();
+    assert_eq!(q_shape[0], 1, "flash_attention_decode_to_bf16 requires seq_len=1");
+    assert_eq!(q_shape[1], n_heads * head_dim);
+    assert_eq!(k_shape[1], n_kv_heads * head_dim);
+
+    let kv_len = k_shape[0];
+    let gqa_ratio_log2 = (n_heads / n_kv_heads).trailing_zeros() as u8;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let kv_stride = (n_kv_heads * head_dim) as u32;
+    let out_stride = (n_heads * head_dim) as u32;
+
+    let kernel_name = format!("flash_attn_decode_bf16_{}_gqa{}", head_dim, n_heads / n_kv_heads);
+    let kernel = runtime.ensure_kernel_blockdsl(&kernel_name, || {
+        fak::build_flash_attn_decode_bf16(head_dim as u32, gqa_ratio_log2)
+    })?;
+
+    // bf16 output padded to [m_pad, n_heads*head_dim]
+    let out_buf = runtime.alloc_zero(m_pad * n_heads * head_dim * 2)?;
+
+    let ka = crate::kernargs![
+        q.buffer_arc().gpu_addr() => u64,
+        k.buffer_arc().gpu_addr() => u64,
+        v.buffer_arc().gpu_addr() => u64,
+        out_buf.gpu_addr() => u64,
+        scale => f32,
+        head_dim as u32 => u32,
+        kv_len as u32 => u32,
+        kv_stride => u32,
+        n_heads as u32 => u32,
+        out_stride => u32
+    ];
+
+    let (gx, _) = fak::flash_attn_decode_grid(n_heads as u32, head_dim as u32);
+    runtime.dispatch(&kernel, [gx, 1, 1], &ka)?;
+
+    Ok(out_buf)
 }
 
 /// CPU reference: scaled dot-product attention (for testing).
