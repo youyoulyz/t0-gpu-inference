@@ -1034,12 +1034,13 @@ impl AsmEmitter {
 
     /// Get the generated assembly text.
     pub fn finish(self) -> String {
-        if self.waits_elided > 0 {
-            eprintln!(
-                "[T0 AsmEmitter] Waitcnt stats: {} emitted, {} elided (redundant)",
-                self.waits_emitted, self.waits_elided
-            );
-        }
+        // Waitcnt stats (disabled — uncomment to debug)
+        // if self.waits_elided > 0 {
+        //     eprintln!(
+        //         "[T0 AsmEmitter] Waitcnt stats: {} emitted, {} elided (redundant)",
+        //         self.waits_emitted, self.waits_elided
+        //     );
+        // }
         self.buf
     }
 }

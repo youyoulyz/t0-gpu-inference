@@ -586,7 +586,11 @@ impl KfdDevice {
             Ok(buf) => Ok(buf),
             Err(e) if e.contains("Invalid argument") || e.contains("EINVAL") => {
                 // Small BAR: host-visible VRAM not available, fall back to non-public VRAM
-                eprintln!("[KFD] alloc_vram PUBLIC failed ({e}), falling back to non-public VRAM (small BAR)");
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[KFD] alloc_vram PUBLIC failed ({e}), falling back to non-public VRAM (small BAR)");
+                }
                 let fallback_flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
                     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
                 self.alloc_memory(size, fallback_flags)
@@ -624,7 +628,8 @@ impl KfdDevice {
         match self.alloc_memory(size, flags) {
             Ok(buf) => Ok(buf),
             Err(e) if e.contains("Invalid argument") || e.contains("EINVAL") => {
-                eprintln!("[KFD] alloc_code PUBLIC failed ({e}), retrying without PUBLIC (small BAR fallback)");
+                // Small BAR fallback (suppressed — uncomment to debug)
+                // eprintln!("[KFD] alloc_code PUBLIC failed ({e}), retrying without PUBLIC (small BAR fallback)");
                 let fallback_flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
                     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
                     KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
@@ -2550,17 +2555,17 @@ impl Pm4Queue {
             self.emit_release_mem(sig.gpu_addr(), 0x12345678DEADBEEF);
         }
 
-        // 8. Dump ring buffer for debugging
-        eprintln!("[PM4] Ring buffer ({} dwords, {} bytes):", self.write_offset / 4, self.write_offset);
-        for i in 0..(self.write_offset / 4) {
-            let dword = unsafe {
-                let ptr = self.ring_buffer.host_ptr.add(i as usize * 4) as *const u32;
-                std::ptr::read_volatile(ptr)
-            };
-            if i % 4 == 0 { eprint!("  [{:3}]:", i); }
-            eprint!(" {:08X}", dword);
-            if i % 4 == 3 || i == self.write_offset / 4 - 1 { eprintln!(); }
-        }
+        // 8. Dump ring buffer for debugging (disabled — uncomment to debug)
+        // eprintln!("[PM4] Ring buffer ({} dwords, {} bytes):", self.write_offset / 4, self.write_offset);
+        // for i in 0..(self.write_offset / 4) {
+        //     let dword = unsafe {
+        //         let ptr = self.ring_buffer.host_ptr.add(i as usize * 4) as *const u32;
+        //         std::ptr::read_volatile(ptr)
+        //     };
+        //     if i % 4 == 0 { eprint!("  [{:3}]:", i); }
+        //     eprint!(" {:08X}", dword);
+        //     if i % 4 == 3 || i == self.write_offset / 4 - 1 { eprintln!(); }
+        // }
 
         // 9. Ring doorbell
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -2694,28 +2699,28 @@ impl GpuKernel {
         let (rsrc1, rsrc2, entry_offset);
         unsafe {
             let kd_host_ptr = code_buf.host_ptr.add(kd_offset);
-            // Debug: dump first 64 bytes of KD
-            let kd_bytes = std::slice::from_raw_parts(kd_host_ptr, 64);
-            eprintln!("[KFD] KD at offset {} (0x{:X}) in code buffer:", kd_offset, kd_offset);
-            for row in 0..4 {
-                let off = row * 16;
-                eprint!("  {:02X}:", off);
-                for i in 0..16 {
-                    eprint!(" {:02X}", kd_bytes[off + i]);
-                }
-                eprintln!();
-            }
+            // Debug: dump first 64 bytes of KD (disabled — uncomment to debug)
+            // let kd_bytes = std::slice::from_raw_parts(kd_host_ptr, 64);
+            // eprintln!("[KFD] KD at offset {} (0x{:X}) in code buffer:", kd_offset, kd_offset);
+            // for row in 0..4 {
+            //     let off = row * 16;
+            //     eprint!("  {:02X}:", off);
+            //     for i in 0..16 {
+            //         eprint!(" {:02X}", kd_bytes[off + i]);
+            //     }
+            //     eprintln!();
+            // }
             let rsrc1_ptr = kd_host_ptr.add(0x30) as *mut u32;
             let raw_rsrc1 = std::ptr::read_volatile(rsrc1_ptr);
             let patched_rsrc1 = raw_rsrc1 | (1 << 20); // PRIV bit only
 
-            // Log WGP status from RSRC1 bit 29 (the real hardware bit)
-            let wgp_on = (patched_rsrc1 >> 29) & 1 == 1;
-            eprintln!("[KFD] RSRC1=0x{:08X} WGP_MODE(bit29)={} MEM_ORD(bit30)={} FWD(bit31)={}",
-                patched_rsrc1,
-                (patched_rsrc1 >> 29) & 1,
-                (patched_rsrc1 >> 30) & 1,
-                (patched_rsrc1 >> 31) & 1);
+            // RSRC1 log (disabled — uncomment to debug)
+            // let wgp_on = (patched_rsrc1 >> 29) & 1 == 1;
+            // eprintln!("[KFD] RSRC1=0x{:08X} WGP_MODE(bit29)={} MEM_ORD(bit30)={} FWD(bit31)={}",
+            //     patched_rsrc1,
+            //     (patched_rsrc1 >> 29) & 1,
+            //     (patched_rsrc1 >> 30) & 1,
+            //     (patched_rsrc1 >> 31) & 1);
 
             std::ptr::write_volatile(rsrc1_ptr, patched_rsrc1);
             rsrc1 = patched_rsrc1;
